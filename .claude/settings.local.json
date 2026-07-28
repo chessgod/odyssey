@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p /workspace/watchers)",
+      "Bash(touch /workspace/watchers/__init__.py)",
+      "Bash(python3 -m pip install -q -r requirements.txt)",
+      "Bash(apt-get install *)",
+      "Bash(apt-get update *)",
+      "Bash(python3 -m pip install -q --break-system-packages -r requirements.txt)",
+      "Bash(python3 *)"
+    ]
+  }
+}
