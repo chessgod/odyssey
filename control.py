@@ -13,6 +13,7 @@ import time
 import requests
 
 import notifier
+from watchers.base import BlockedError, FetchError, ParseError, fetch_rendered_html
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,8 @@ POLL_TIMEOUT_SECONDS = 30
 HELP_TEXT = (
     "Commands:\n"
     "/status - uptime, checks, alerts, and failures per venue\n"
+    "/peek [venue] - live fetch right now (text + screenshot) so you can\n"
+    "  verify, e.g. /peek BFI or /peek Science Museum. No venue = all.\n"
     "/restart - restart the process (systemd brings it back up)\n"
     "/help - show this message"
 )
@@ -167,10 +170,66 @@ def perform_restart():
     os._exit(0)
 
 
-def handle_command(text: str, stats: Stats):
-    command = text.strip().lower().split()[0] if text.strip() else ""
+def handle_peek(watchers, venue_query: str = None):
+    """Fetch venues live right now (bypassing the schedule) and reply with the
+    actual parsed data plus a screenshot, so it can be checked against the
+    real site directly rather than trusted blind. With no venue_query, peeks
+    every venue; otherwise only venues whose display name matches (case
+    insensitive, substring)."""
+    if venue_query:
+        query = venue_query.strip().lower()
+        matched = [w for w in watchers if query in w.display_name.lower()]
+        if not matched:
+            known = ", ".join(w.display_name for w in watchers)
+            notifier.send_message(f"No venue matching {venue_query!r}. Known venues: {known}")
+            return
+        watchers = matched
+
+    for watcher in watchers:
+        for url in watcher.urls:
+            try:
+                html, screenshot = fetch_rendered_html(url, capture_screenshot=True)
+            except BlockedError as e:
+                notifier.send_message(f"{watcher.display_name}: blocked right now\n{e}\n{url}")
+                continue
+            except FetchError as e:
+                notifier.send_message(f"{watcher.display_name}: fetch failed\n{e}\n{url}")
+                continue
+
+            try:
+                items = watcher.parse_url(url, html)
+            except ParseError as e:
+                notifier.send_message(f"{watcher.display_name}: parser broke\n{e}\n{url}")
+                if screenshot:
+                    notifier.send_photo(
+                        screenshot, caption=f"{watcher.display_name} — live screenshot (parse failed)"
+                    )
+                continue
+
+            if items:
+                lines = [f"{watcher.display_name} — live peek, {len(items)} items", url, ""]
+                for item_id, info in sorted(items.items()):
+                    lines.append(f"{item_id}: {info['status']}")
+                notifier.send_message("\n".join(lines))
+            else:
+                notifier.send_message(f"{watcher.display_name}: 0 items right now\n{url}")
+
+            if screenshot:
+                notifier.send_photo(screenshot, caption=f"{watcher.display_name} — live screenshot")
+
+
+def handle_command(text: str, stats: Stats, watchers):
+    stripped = text.strip()
+    if not stripped:
+        return
+    parts = stripped.split(maxsplit=1)
+    command = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else None
+
     if command in ("/status", "/stats"):
         notifier.send_message(stats.snapshot_text())
+    elif command == "/peek":
+        handle_peek(watchers, arg)
     elif command == "/restart":
         notifier.send_message("Restarting...")
         perform_restart()
@@ -193,7 +252,7 @@ def _clear_backlog(url: str) -> int:
     return None
 
 
-def run_command_listener(stats: Stats):
+def run_command_listener(stats: Stats, watchers):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -229,10 +288,10 @@ def run_command_listener(stats: Stats):
                 )
                 continue
 
-            handle_command(text, stats)
+            handle_command(text, stats, watchers)
 
 
-def start_listener_thread(stats: Stats):
-    thread = threading.Thread(target=run_command_listener, args=(stats,), daemon=True)
+def start_listener_thread(stats: Stats, watchers):
+    thread = threading.Thread(target=run_command_listener, args=(stats, watchers), daemon=True)
     thread.start()
     return thread

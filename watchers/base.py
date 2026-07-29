@@ -11,10 +11,25 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+# Both target sites are UK venues; a browser context that actually looks like
+# an ordinary UK desktop visitor (locale, timezone, viewport, Accept-Language)
+# measurably avoids bot-protection blocks that Playwright's bare defaults
+# (no Accept-Language header, generic viewport) tend to trip. This is just
+# presenting an honest, realistic browser fingerprint - not solving or
+# bypassing any human-verification challenge.
+BROWSER_LOCALE = "en-GB"
+BROWSER_TIMEZONE = "Europe/London"
+BROWSER_VIEWPORT = {"width": 1366, "height": 768}
+EXTRA_HTTP_HEADERS = {"Accept-Language": "en-GB,en;q=0.9"}
+
 UNAVAILABLE_STATUSES = {"sold_out"}
 
 BLOCK_TITLE_MARKERS = ("just a moment", "attention required", "access denied")
 BLOCK_CONTENT_MARKERS = ("incapsula incident", "request unsuccessful")
+
+# Both target sites use the same OneTrust cookie consent banner, which
+# visually covers page content (and screenshots) until dismissed.
+COOKIE_ACCEPT_SELECTOR = "#onetrust-accept-btn-handler"
 
 
 class FetchError(Exception):
@@ -29,14 +44,30 @@ class ParseError(Exception):
     """A page's structure no longer matches the parser. Worth alerting on."""
 
 
-def fetch_rendered_html(url: str, wait_ms: int = 6000, timeout_ms: int = 30000) -> str:
-    """Fetch a URL with a real browser and return the fully rendered HTML."""
+def fetch_rendered_html(
+    url: str, wait_ms: int = 6000, timeout_ms: int = 30000, capture_screenshot: bool = False
+):
+    """Fetch a URL with a real browser, return (html, screenshot_bytes_or_None)."""
     with sync_playwright() as p:
         browser = p.chromium.launch()
         try:
-            page = browser.new_page(user_agent=USER_AGENT)
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                locale=BROWSER_LOCALE,
+                timezone_id=BROWSER_TIMEZONE,
+                viewport=BROWSER_VIEWPORT,
+                extra_http_headers=EXTRA_HTTP_HEADERS,
+            )
+            page = context.new_page()
             response = page.goto(url, timeout=timeout_ms)
             page.wait_for_timeout(wait_ms)
+
+            try:
+                page.locator(COOKIE_ACCEPT_SELECTOR).click(timeout=3000)
+                page.wait_for_timeout(500)
+            except Exception:
+                pass  # no cookie banner present, or it didn't appear in time
+
             status = response.status if response else None
             title = (page.title() or "").strip().lower()
 
@@ -54,7 +85,8 @@ def fetch_rendered_html(url: str, wait_ms: int = 6000, timeout_ms: int = 30000) 
             if any(marker in lower_content for marker in BLOCK_CONTENT_MARKERS):
                 raise BlockedError(f"Blocked by bot-protection challenge fetching {url}")
 
-            return content
+            screenshot = page.screenshot(full_page=True) if capture_screenshot else None
+            return content, screenshot
         finally:
             browser.close()
 
@@ -83,7 +115,7 @@ class Watcher:
         issues = []
         for url in self.urls:
             try:
-                html = fetch_rendered_html(url)
+                html, _screenshot = fetch_rendered_html(url)
             except BlockedError as e:
                 logger.warning("%s: blocked fetching %s: %s", self.name, url, e)
                 issues.append((url, "blocked", str(e)))

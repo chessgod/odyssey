@@ -9,6 +9,7 @@ deduplicated by performance id via dict keys.
 
 from bs4 import BeautifulSoup
 
+import config
 from watchers.base import ParseError, Watcher
 
 
@@ -43,4 +44,11 @@ class ScienceMuseumWatcher(Watcher):
                 "label": f"Science Museum — {name} {time_text}".strip(),
                 "url": href,
             }
+
+        keyword = config.SCIENCE_MUSEUM_EXPECTED_KEYWORD
+        if items and not any(keyword in v["label"].lower() for v in items.values()):
+            raise ParseError(
+                f"None of the {len(items)} items mention {keyword!r} "
+                "— wrong event, or the calendar now covers something else?"
+            )
         return items

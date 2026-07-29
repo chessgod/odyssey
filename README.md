@@ -8,7 +8,8 @@ available. **Alert-only** — it never buys, reserves, adds to basket, submits
 forms, or logs in.
 
 Currently watches:
-- **BFI Odyssey IMAX 70mm** — per-date availability from the film's permalink page.
+- **BFI Odyssey IMAX 70mm** — availability for the ~5 nearest upcoming
+  performances, read from the visible results list on the film's permalink page.
 - **Science Museum — The Odyssey** — per-performance availability from the events calendar.
 
 ## How it works
@@ -31,6 +32,16 @@ While the watch loop is running, message the bot directly:
 
 - `/status` (or `/stats`) — uptime, cycles completed, and per-venue checks,
   requests made, alerts sent, fetch failures, blocks, and parse errors.
+  Distinguishes a problem that's happening right now from one that's
+  already resolved (e.g. `Status: CURRENTLY BLOCKED (3 checks in a row,
+  started 12m ago)` vs `Status: OK` with `Last issue: resolved, occurred
+  12m ago`).
+- `/peek [venue]` — fetches live right now (bypassing the schedule) and
+  replies with the actual parsed data plus a screenshot of the real
+  rendered page, so you can check it against the live site yourself instead
+  of trusting the alerter blind. With no venue, peeks all of them; name one
+  to scope it, e.g. `/peek BFI` or `/peek Science Museum` (case-insensitive,
+  matches by substring against the venue's display name).
 - `/restart` — exits the process. Under systemd with `Restart=always` (see
   below), it comes straight back up — handy for restarting from your phone.
 - `/help` — lists the commands.
@@ -42,18 +53,39 @@ a historical total.
 
 ### Known quirks (found by inspecting the real pages)
 
-- **BFI**: only the film's permalink URL is watched. Its paginated search
-  results (page 2, 3, ...) use a session-bound token and are gated by an
-  interactive Cloudflare Turnstile challenge that doesn't clear automatically
-  — so they're deliberately not scraped. Instead, the permalink page embeds a
-  `calendar_days` JSON block with per-date availability for a rolling ~6-week
-  window, which is what gets parsed. This means dates further out (e.g. a
-  screening in December when today is July) won't be tracked until they roll
-  into that window.
-- **Science Museum**: uses Incapsula bot protection. It can intermittently
-  block a fetch, especially under rapid repeated requests. The watcher
-  detects this (`BlockedError`) and backs off rather than treating it as a
-  parsing failure or a false "item removed" event.
+- **BFI**: only the film's permalink URL is watched, and only the ~5
+  performances visible in that page's results list are tracked — not the
+  whole run. Two other paths were tried and ruled out: BFI's paginated
+  search results (page 2, 3, ...), and clicking a specific date in the
+  on-page calendar widget. Both go through a search backend gated by an
+  interactive Cloudflare Turnstile challenge (an actual "verify you're
+  human" checkbox) that doesn't clear on its own — unlike page 1's load,
+  which only needs a lightweight JS challenge a real browser passes
+  automatically. Turnstile isn't something this project will try to bypass.
+  An earlier version of the parser read a `calendar_days` JSON block
+  embedded in the page instead, on the assumption its numeric codes meant
+  per-date availability across a ~6-week window; that assumption turned out
+  to be wrong (it reported dates as available that were actually sold out,
+  and there was no way to verify the code meanings against the real site),
+  so it was dropped for the current, verified approach.
+- **Science Museum**: sits behind Incapsula bot protection. Testing found
+  Playwright's bare default browser context (no `Accept-Language` header,
+  a generic viewport size) reliably got blocked, while a context configured
+  to look like an ordinary UK desktop browser (locale, timezone, viewport,
+  `Accept-Language`) reliably didn't — that's what `watchers/base.py` now
+  uses for every fetch. Under sustained/repeated request volume in a short
+  window it can still trip a rate-based block regardless of fingerprint;
+  the watcher detects this (`BlockedError`) and backs off rather than
+  treating it as a parsing failure or a false "item removed" event.
+- **Identity checks**: each parser verifies the fetched page/items actually
+  mention the expected film (`config.BFI_EXPECTED_KEYWORD` /
+  `SCIENCE_MUSEUM_EXPECTED_KEYWORD`) before trusting the data. A mismatch is
+  treated as a broken parser (alerts you) instead of silently trusting
+  whatever happened to be on the page.
+- **Cookie banner**: both sites show the same OneTrust cookie consent
+  banner, which visually covers page content until dismissed. Every fetch
+  clicks it away (best-effort, harmless if absent) so `/peek` screenshots
+  show the real page, not a banner.
 - If a venue's very first check ever fails outright (e.g. blocked), the
   baseline is deferred to the next successful check — so you won't get a
   flood of false "NEW" alerts once the site becomes reachable again.

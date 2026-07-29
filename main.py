@@ -20,7 +20,7 @@ from watchers.science_museum import ScienceMuseumWatcher
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "ticket_alerter.log")
 
-MAX_BACKOFF_MULTIPLIER = 8
+MAX_BACKOFF_MULTIPLIER = 16
 
 
 def setup_logging():
@@ -107,7 +107,7 @@ def watch_loop(logger):
     consecutive_blocked_cycles = 0
 
     stats = control.Stats()
-    control.start_listener_thread(stats)
+    control.start_listener_thread(stats, watchers)
 
     while True:
         any_blocked = run_cycle(watchers, state, logger, stats)
