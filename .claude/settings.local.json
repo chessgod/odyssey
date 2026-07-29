@@ -7,7 +7,9 @@
       "Bash(apt-get install *)",
       "Bash(apt-get update *)",
       "Bash(python3 -m pip install -q --break-system-packages -r requirements.txt)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/124.0 Safari/537.36\" https://whatson.bfi.org.uk/robots.txt)",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/124.0 Safari/537.36\" https://my.sciencemuseum.org.uk/robots.txt)"
     ]
   }
 }
