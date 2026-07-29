@@ -25,6 +25,7 @@ KNOWN_CODES = {"1", "2", "3", "4"}
 
 class BFIWatcher(Watcher):
     name = "bfi"
+    display_name = "BFI"
 
     def parse_url(self, url: str, html: str) -> dict:
         match = CALENDAR_BLOCK_RE.search(html)

@@ -14,6 +14,7 @@ from watchers.base import ParseError, Watcher
 
 class ScienceMuseumWatcher(Watcher):
     name = "science_museum"
+    display_name = "Science Museum"
 
     def parse_url(self, url: str, html: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")

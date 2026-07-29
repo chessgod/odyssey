@@ -17,11 +17,28 @@ Currently watches:
 - `watchers/bfi.py`, `watchers/science_museum.py` — per-site parsers.
 - `state.py` — persists the last-seen snapshot to `data/state.json` so restarts don't re-alert.
 - `notifier.py` — sends Telegram messages.
+- `control.py` — background thread that listens for `/status` and `/restart`
+  commands sent back to the bot, and the in-memory stats counters they read.
 - `config.py` — URLs, poll interval, jitter (no secrets).
 - `main.py` — the loop.
 
 Both sites are JavaScript-rendered, so both are fetched with Playwright
 (headless Chromium), not plain `requests`.
+
+## Remote control via Telegram
+
+While the watch loop is running, message the bot directly:
+
+- `/status` (or `/stats`) — uptime, cycles completed, and per-venue checks,
+  requests made, alerts sent, fetch failures, blocks, and parse errors.
+- `/restart` — exits the process. Under systemd with `Restart=always` (see
+  below), it comes straight back up — handy for restarting from your phone.
+- `/help` — lists the commands.
+
+Only messages from the `TELEGRAM_CHAT_ID` in your `.env` are accepted;
+anything else is logged and ignored. Stats are in-memory and reset on every
+restart (including `/restart` itself) — they reflect the current run, not
+a historical total.
 
 ### Known quirks (found by inspecting the real pages)
 
@@ -119,7 +136,7 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/ticket-alerter
 EnvironmentFile=/home/ubuntu/ticket-alerter/.env
 ExecStart=/home/ubuntu/ticket-alerter/.venv/bin/python3 main.py
-Restart=on-failure
+Restart=always
 RestartSec=10
 
 [Install]
@@ -129,6 +146,10 @@ WantedBy=multi-user.target
 Note: `EnvironmentFile` reads `KEY=value` lines directly, so `.env` works
 as-is (no need for `python-dotenv` in that path, though `main.py` also
 loads it itself, so both work).
+
+`Restart=always` (not `on-failure`) is required for the `/restart` Telegram
+command to actually bring the process back — `/restart` exits cleanly with
+status 0, which `on-failure` would treat as "nothing to restart."
 
 ```bash
 sudo systemctl daemon-reload

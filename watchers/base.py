@@ -63,6 +63,7 @@ class Watcher:
     """Base class. Subclasses implement parse_url() for one venue's page structure."""
 
     name = "base"
+    display_name = "Base"
 
     def __init__(self, urls):
         self.urls = urls

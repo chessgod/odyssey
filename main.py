@@ -10,6 +10,7 @@ import time
 from dotenv import load_dotenv
 
 import config
+import control
 import notifier
 import state as state_module
 from watchers.base import diff
@@ -41,11 +42,12 @@ def build_watchers():
     ]
 
 
-def run_cycle(watchers, state, logger) -> bool:
+def run_cycle(watchers, state, logger, stats) -> bool:
     """Run one check cycle for all watchers. Returns True if any fetch was blocked."""
     any_blocked = False
 
     for watcher in watchers:
+        stats.ensure_venue(watcher.name, watcher.display_name)
         try:
             combined, issues = watcher.check()
         except Exception:
@@ -67,9 +69,11 @@ def run_cycle(watchers, state, logger) -> bool:
                     "%s: no items fetched this cycle (all URLs failed), deferring baseline",
                     watcher.name,
                 )
+                stats.record_check(watcher.name, len(watcher.urls), 0, 0, issues)
                 continue
             state[watcher.name] = combined
             logger.info("%s: baseline recorded (%d items)", watcher.name, len(combined))
+            stats.record_check(watcher.name, len(watcher.urls), len(combined), 0, issues)
             continue
 
         alerts = diff(old, combined)
@@ -83,6 +87,8 @@ def run_cycle(watchers, state, logger) -> bool:
             merged = dict(old)
             merged.update(combined)
             state[watcher.name] = merged
+
+        stats.record_check(watcher.name, len(watcher.urls), len(state[watcher.name]), len(alerts), issues)
 
         logger.info(
             "%s: checked (%d items, %d alerts, %d issues)",
@@ -100,8 +106,12 @@ def watch_loop(logger):
     state = state_module.load()
     consecutive_blocked_cycles = 0
 
+    stats = control.Stats()
+    control.start_listener_thread(stats)
+
     while True:
-        any_blocked = run_cycle(watchers, state, logger)
+        any_blocked = run_cycle(watchers, state, logger, stats)
+        stats.record_cycle()
         state_module.save(state)
 
         if any_blocked:
