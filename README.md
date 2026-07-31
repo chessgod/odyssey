@@ -8,8 +8,9 @@ available. **Alert-only** — it never buys, reserves, adds to basket, submits
 forms, or logs in.
 
 Currently watches:
-- **BFI Odyssey IMAX 70mm** — availability for the ~5 nearest upcoming
-  performances, read from the visible results list on the film's permalink page.
+- **BFI Odyssey IMAX 70mm** — availability across the full run (currently
+  ~130 performances, July 2026 through the last known December dates), via
+  a handful of date-range-filtered search URLs.
 - **Science Museum — The Odyssey** — per-performance availability from the events calendar.
 
 ## How it works
@@ -18,8 +19,9 @@ Currently watches:
 - `watchers/bfi.py`, `watchers/science_museum.py` — per-site parsers.
 - `state.py` — persists the last-seen snapshot to `data/state.json` so restarts don't re-alert.
 - `notifier.py` — sends Telegram messages.
-- `control.py` — background thread that listens for `/status` and `/restart`
-  commands sent back to the bot, and the in-memory stats counters they read.
+- `control.py` — background thread that listens for `/status`, `/peek`,
+  `/stop`, `/start`, and `/restart` commands sent back to the bot, and the
+  in-memory stats counters `/status` reads from.
 - `config.py` — URLs, poll interval, jitter (no secrets).
 - `main.py` — the loop.
 
@@ -42,6 +44,12 @@ While the watch loop is running, message the bot directly:
   of trusting the alerter blind. With no venue, peeks all of them; name one
   to scope it, e.g. `/peek BFI` or `/peek Science Museum` (case-insensitive,
   matches by substring against the venue's display name).
+- `/stop` — pauses checks. The process keeps running (so `/start` still
+  works) — it's an in-process pause via a shared flag, not a real
+  `systemctl stop`. No sudo, no shelling out, same safety posture as
+  everything else here. Doesn't persist across a restart/crash/reboot —
+  those always come back up running by default.
+- `/start` — resumes checks after `/stop`.
 - `/restart` — exits the process. Under systemd with `Restart=always` (see
   below), it comes straight back up — handy for restarting from your phone.
 - `/help` — lists the commands.
@@ -53,30 +61,34 @@ a historical total.
 
 ### Known quirks (found by inspecting the real pages)
 
-- **BFI**: only the film's permalink URL is watched, and only the ~5
-  performances visible in that page's results list are tracked — not the
-  whole run. Two other paths were tried and ruled out: BFI's paginated
-  search results (page 2, 3, ...), and clicking a specific date in the
-  on-page calendar widget. Both go through a search backend gated by an
-  interactive Cloudflare Turnstile challenge (an actual "verify you're
-  human" checkbox) that doesn't clear on its own — unlike page 1's load,
-  which only needs a lightweight JS challenge a real browser passes
-  automatically. Turnstile isn't something this project will try to bypass.
-  An earlier version of the parser read a `calendar_days` JSON block
-  embedded in the page instead, on the assumption its numeric codes meant
-  per-date availability across a ~6-week window; that assumption turned out
-  to be wrong (it reported dates as available that were actually sold out,
-  and there was no way to verify the code meanings against the real site),
-  so it was dropped for the current, verified approach.
-- **Science Museum**: sits behind Incapsula bot protection. Testing found
-  Playwright's bare default browser context (no `Accept-Language` header,
-  a generic viewport size) reliably got blocked, while a context configured
-  to look like an ordinary UK desktop browser (locale, timezone, viewport,
-  `Accept-Language`) reliably didn't — that's what `watchers/base.py` now
-  uses for every fetch. Under sustained/repeated request volume in a short
-  window it can still trip a rate-based block regardless of fingerprint;
-  the watcher detects this (`BlockedError`) and backs off rather than
-  treating it as a parsing failure or a false "item removed" event.
+- **BFI**: clicking pagination or a date in the on-page calendar both go
+  through a search backend gated by an interactive Cloudflare Turnstile
+  challenge (an actual "verify you're human" checkbox) that doesn't clear
+  on its own when reached via a same-session click/AJAX navigation.
+  Turnstile isn't something this project will try to bypass. What does
+  work: a **fresh top-level navigation** straight to a date-range-filtered
+  search URL (never clicked-into from another page in the same browser
+  session) loads cleanly, same as loading page 1 directly does — Turnstile
+  appears to trigger on in-session navigation specifically, not on the
+  search endpoint itself. `config.BFI_URLS` is a handful of these
+  constructed URLs, each covering a date window sized to stay under the
+  50-result-per-page limit (the parser raises an alert if a window ever
+  fills up, rather than silently truncating). Since a date-range search
+  returns every film playing then, not just this one, results are filtered
+  per-item by name rather than trusting the whole page. An earlier version
+  of the parser instead read a `calendar_days` JSON block embedded in the
+  page, assuming its numeric codes meant per-date availability; that
+  assumption turned out to be wrong (it reported dates as available that
+  were actually sold out, unverifiable against anything real), so it was
+  dropped for this actually-checkable approach.
+- **Science Museum**: sits behind Incapsula. A realistic browser context
+  (locale, timezone, viewport, `Accept-Language` — see below) measurably
+  helps versus Playwright's bare defaults, but real production logs showed
+  it still failing on a fresh VM IP that had never touched the site before,
+  almost the entire first day. That points less at bot-fingerprinting and
+  more at genuine high-demand queuing/rate-limiting affecting everyone,
+  which matches what's visible manually on the site. See "Retries and
+  backoff" below for how this is handled.
 - **Identity checks**: each parser verifies the fetched page/items actually
   mention the expected film (`config.BFI_EXPECTED_KEYWORD` /
   `SCIENCE_MUSEUM_EXPECTED_KEYWORD`) before trusting the data. A mismatch is
@@ -89,6 +101,32 @@ a historical total.
 - If a venue's very first check ever fails outright (e.g. blocked), the
   baseline is deferred to the next successful check — so you won't get a
   flood of false "NEW" alerts once the site becomes reachable again.
+
+### Retries and backoff
+
+Each URL gets up to 3 attempts, 15 seconds apart, before a check is treated
+as failed for that cycle (`watchers/base.py`, `RETRY_ATTEMPTS` /
+`RETRY_WAIT_SECONDS`). This covers a queue page, a slow-clearing Cloudflare
+challenge, or any other short-lived interstitial — instead of immediately
+giving up and letting the much longer inter-cycle backoff kick in, which
+would risk sleeping through the exact moment a drop happens (ticket drops
+cause traffic spikes, traffic spikes cause queues/blocks — backing off
+harder in response is backwards for an alerter). The final attempt for a
+URL always grabs a screenshot, which gets attached to the "parser may be
+broken" Telegram alert automatically — so a queue page or other unexpected
+interstitial is visible without needing to catch it live with `/peek`.
+
+On top of that, if a whole cycle comes back blocked, the *next* cycle's
+wait is multiplied (2x, capped at 4x the normal interval) before trying
+again — deliberately capped low (~12–16 min max, not the nearly-an-hour it
+used to allow) for the same reason: the in-cycle retries already absorb
+short blips, so inter-cycle backoff is really just for genuinely sustained
+outages, where being that much more polite isn't worth the size of the
+blind spot it creates.
+
+With BFI now spanning several URLs, a fully-bad cycle (everything retried
+to exhaustion) can take several minutes rather than seconds — the loop just
+runs the next cycle later than usual when that happens, nothing breaks.
 
 ## 1. Telegram bot setup
 
@@ -194,8 +232,13 @@ journalctl -u ticket-alerter -f
 
 1. Create an **Always Free** compute instance (Ampere A1 or VM.Standard.E2.1.Micro,
    Ubuntu 22.04/24.04 image) in the OCI console.
-2. Open port 22 only — this app makes outbound requests, it doesn't need any
-   inbound ports open. Leave the default security list as-is or lock it down
+2. Open port 22 only. This still holds even with `/status`, `/peek`, and
+   `/restart`: the command listener works by long-polling Telegram's
+   `getUpdates` API — the VM repeatedly asks Telegram "any new messages?"
+   over an outbound HTTPS connection, rather than Telegram pushing to a
+   webhook on the VM. Nothing in this app binds a socket or listens for
+   inbound connections; everything (alerts, screenshots, and commands) is
+   outbound-only. Leave the default security list as-is or lock it down
    further; no need to open anything new.
 3. SSH in and set up the system:
 

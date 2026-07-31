@@ -3,14 +3,39 @@
 CHECK_INTERVAL_SECONDS = 180  # ~3 minutes
 JITTER_SECONDS = 45  # random +/- jitter applied to each interval
 
-#   Only the permalink URL (page 1) is watched — its visible results list is
-#   the only BFI data reachable without hitting an interactive Cloudflare
-#   Turnstile challenge that doesn't auto-resolve (triggered by pagination
-#   URLs and by date-filter clicks alike). This means only the ~5 nearest
-#   upcoming performances are tracked, not the full run.
-BFI_URLS = [
-    "https://whatson.bfi.org.uk/imax/Online/default.asp?BOparam%3A%3AWScontent%3A%3AloadArticle%3A%3Apermalink=odyssey-the-film-imax-70mm-2026",
+#   Each URL is a date-range-filtered BFI search, loaded as a fresh
+#   top-level navigation. Turnstile only seems to trigger on navigating to
+#   the search backend *within* a session that already loaded another page
+#   (pagination links, date-filter clicks) — a brand new session going
+#   straight to a search URL loads cleanly. Windows are sized to stay
+#   comfortably under the 50-result page-size limit based on live testing
+#   on 2026-07-31 (watchers/bfi.py alerts if a window ever fills up, rather
+#   than silently truncating); review/adjust these as dates pass or BFI's
+#   schedule changes.
+_BFI_ARTICLE_SEARCH_ID = "49C49C83-6BA0-420C-A784-9B485E36E2E0"
+_BFI_SEARCH_URL_TEMPLATE = (
+    "https://whatson.bfi.org.uk/imax/Online/default.asp?"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Avenue_filter=&"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Acity_filter=&"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Amonth_filter=&"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Aobject_type_filter=&"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Acategory_filter=&"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_from=&"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_to=&"
+    "doWork%3A%3AWScontent%3A%3Asearch=1&"
+    f"BOparam%3A%3AWScontent%3A%3Asearch%3A%3Aarticle_search_id={_BFI_ARTICLE_SEARCH_ID}&"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_criteria=&"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_from={frm}&"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_to={to}"
+)
+BFI_DATE_WINDOWS = [
+    ("2026-7-29", "2026-8-7"),
+    ("2026-8-8", "2026-8-17"),
+    ("2026-8-18", "2026-8-27"),
+    ("2026-8-28", "2026-9-30"),
+    ("2026-10-1", "2027-12-31"),
 ]
+BFI_URLS = [_BFI_SEARCH_URL_TEMPLATE.format(frm=frm, to=to) for frm, to in BFI_DATE_WINDOWS]
 
 SCIENCE_MUSEUM_URLS = [
     "https://my.sciencemuseum.org.uk/events?view=calendar&kid=794&startdate=01-07-2026",

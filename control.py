@@ -25,6 +25,8 @@ HELP_TEXT = (
     "/status - uptime, checks, alerts, and failures per venue\n"
     "/peek [venue] - live fetch right now (text + screenshot) so you can\n"
     "  verify, e.g. /peek BFI or /peek Science Museum. No venue = all.\n"
+    "/stop - pause checks (process keeps running so /start still works)\n"
+    "/start - resume checks after /stop\n"
     "/restart - restart the process (systemd brings it back up)\n"
     "/help - show this message"
 )
@@ -85,8 +87,8 @@ class Stats:
             v["alerts_sent"] += alerts_sent
             v["last_check_time"] = now
 
-            kinds_this_check = {kind for _url, kind, _message in issues}
-            for _url, kind, _message in issues:
+            kinds_this_check = {kind for _url, kind, _message, _screenshot in issues}
+            for _url, kind, _message, _screenshot in issues:
                 if kind == "blocked":
                     v["blocked"] += 1
                 elif kind == "fetch_failed":
@@ -99,7 +101,7 @@ class Stats:
                 v["consecutive_issues"] += 1
                 v["last_issue_time"] = now
                 v["last_issue_message"] = "; ".join(
-                    f"{kind}: {message}" for _url, kind, message in issues
+                    f"{kind}: {message}" for _url, kind, message, _screenshot in issues
                 )
             else:
                 v["last_check_outcome"] = "ok"
@@ -164,6 +166,31 @@ class Stats:
             return "\n".join(lines)
 
 
+class RunControl:
+    """Pauses/resumes the watch loop in-process via /stop and /start, without
+    killing the process - so the command listener (and /start) stay reachable
+    even while paused. No systemd/sudo involved, no privilege escalation."""
+
+    def __init__(self):
+        self._running = threading.Event()
+        self._running.set()
+        self.stopped_at = None
+
+    def stop(self):
+        self._running.clear()
+        self.stopped_at = time.time()
+
+    def start(self):
+        self._running.set()
+        self.stopped_at = None
+
+    def is_running(self) -> bool:
+        return self._running.is_set()
+
+    def wait_until_running(self):
+        self._running.wait()
+
+
 def perform_restart():
     """Exit the process. systemd (Restart=always) is expected to bring it back up."""
     logger.info("Restart requested via Telegram command, exiting")
@@ -191,9 +218,17 @@ def handle_peek(watchers, venue_query: str = None):
                 html, screenshot = fetch_rendered_html(url, capture_screenshot=True)
             except BlockedError as e:
                 notifier.send_message(f"{watcher.display_name}: blocked right now\n{e}\n{url}")
+                if e.screenshot:
+                    notifier.send_photo(
+                        e.screenshot, caption=f"{watcher.display_name} — live screenshot (blocked)"
+                    )
                 continue
             except FetchError as e:
                 notifier.send_message(f"{watcher.display_name}: fetch failed\n{e}\n{url}")
+                if e.screenshot:
+                    notifier.send_photo(
+                        e.screenshot, caption=f"{watcher.display_name} — live screenshot (fetch failed)"
+                    )
                 continue
 
             try:
@@ -218,7 +253,7 @@ def handle_peek(watchers, venue_query: str = None):
                 notifier.send_photo(screenshot, caption=f"{watcher.display_name} — live screenshot")
 
 
-def handle_command(text: str, stats: Stats, watchers):
+def handle_command(text: str, stats: Stats, watchers, run_control: RunControl):
     stripped = text.strip()
     if not stripped:
         return
@@ -227,13 +262,30 @@ def handle_command(text: str, stats: Stats, watchers):
     arg = parts[1].strip() if len(parts) > 1 else None
 
     if command in ("/status", "/stats"):
-        notifier.send_message(stats.snapshot_text())
+        if run_control.is_running():
+            header = "Watch loop: RUNNING"
+        else:
+            since = format_duration(time.time() - run_control.stopped_at)
+            header = f"Watch loop: STOPPED ({since} ago, send /start to resume)"
+        notifier.send_message(header + "\n\n" + stats.snapshot_text())
     elif command == "/peek":
         handle_peek(watchers, arg)
+    elif command == "/stop":
+        if run_control.is_running():
+            run_control.stop()
+            notifier.send_message("Stopped. Checks paused — send /start to resume.")
+        else:
+            notifier.send_message("Already stopped.")
+    elif command == "/start":
+        if run_control.is_running():
+            notifier.send_message("Already running.")
+        else:
+            run_control.start()
+            notifier.send_message("Resumed. Checks will continue on schedule.")
     elif command == "/restart":
         notifier.send_message("Restarting...")
         perform_restart()
-    elif command in ("/help", "/start"):
+    elif command == "/help":
         notifier.send_message(HELP_TEXT)
     else:
         logger.info("Command listener: unrecognized command %r", text)
@@ -252,7 +304,7 @@ def _clear_backlog(url: str) -> int:
     return None
 
 
-def run_command_listener(stats: Stats, watchers):
+def run_command_listener(stats: Stats, watchers, run_control: RunControl):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -288,10 +340,12 @@ def run_command_listener(stats: Stats, watchers):
                 )
                 continue
 
-            handle_command(text, stats, watchers)
+            handle_command(text, stats, watchers, run_control)
 
 
-def start_listener_thread(stats: Stats, watchers):
-    thread = threading.Thread(target=run_command_listener, args=(stats, watchers), daemon=True)
+def start_listener_thread(stats: Stats, watchers, run_control: RunControl):
+    thread = threading.Thread(
+        target=run_command_listener, args=(stats, watchers, run_control), daemon=True
+    )
     thread.start()
     return thread

@@ -20,7 +20,7 @@ from watchers.science_museum import ScienceMuseumWatcher
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "ticket_alerter.log")
 
-MAX_BACKOFF_MULTIPLIER = 16
+MAX_BACKOFF_MULTIPLIER = 4
 
 
 def setup_logging():
@@ -54,13 +54,17 @@ def run_cycle(watchers, state, logger, stats) -> bool:
             logger.exception("%s: unexpected error during check, skipping this cycle", watcher.name)
             continue
 
-        for url, kind, message in issues:
+        for url, kind, message, screenshot in issues:
             if kind == "blocked":
                 any_blocked = True
             elif kind == "parse_broken":
                 notifier.send_message(
                     f"[ticket-alerter] {watcher.name} parser may be broken for {url}\n{message}"
                 )
+                if screenshot:
+                    notifier.send_photo(
+                        screenshot, caption=f"{watcher.display_name} — screenshot at time of failure"
+                    )
 
         old = state.get(watcher.name)
         if old is None:
@@ -107,9 +111,11 @@ def watch_loop(logger):
     consecutive_blocked_cycles = 0
 
     stats = control.Stats()
-    control.start_listener_thread(stats, watchers)
+    run_control = control.RunControl()
+    control.start_listener_thread(stats, watchers, run_control)
 
     while True:
+        run_control.wait_until_running()
         any_blocked = run_cycle(watchers, state, logger, stats)
         stats.record_cycle()
         state_module.save(state)
