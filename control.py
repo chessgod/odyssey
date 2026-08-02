@@ -7,6 +7,7 @@ object the watch loop updates each cycle and /status reads from.
 
 import logging
 import os
+import re
 import threading
 import time
 
@@ -18,6 +19,20 @@ from watchers.base import BlockedError, FetchError, ParseError, fetch_rendered_h
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/getUpdates"
+
+# BFI's URLs are 500+ char search query strings; embedded in an issue
+# message (as "... fetching <url>") they were blowing /status past
+# Telegram's 4096-char limit and truncating other venues out of it. /status
+# only needs the block/failure *reason*, not the link - that's what /peek
+# is for.
+_URL_WITH_PREPOSITION_RE = re.compile(r"\s*(?:fetching|for)\s+https?://\S+", re.I)
+_BARE_URL_RE = re.compile(r"https?://\S+")
+
+
+def _strip_urls(text: str) -> str:
+    text = _URL_WITH_PREPOSITION_RE.sub("", text)
+    text = _BARE_URL_RE.sub("", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
 POLL_TIMEOUT_SECONDS = 30
 
 HELP_TEXT = (
@@ -106,7 +121,7 @@ class Stats:
                 v["consecutive_issues"] += 1
                 v["last_issue_time"] = now
                 v["last_issue_message"] = "; ".join(
-                    f"{kind}: {message}" for _url, kind, message, _screenshot in issues
+                    f"{kind}: {_strip_urls(message)}" for _url, kind, message, _screenshot in issues
                 )
             else:
                 v["last_check_outcome"] = "ok"
