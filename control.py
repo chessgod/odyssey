@@ -221,11 +221,13 @@ def perform_restart():
 
 
 def handle_peek(watchers, venue_query: str = None):
-    """Fetch venues live right now (bypassing the schedule) and reply with the
-    actual parsed data plus a screenshot, so it can be checked against the
-    real site directly rather than trusted blind. With no venue_query, peeks
-    every venue; otherwise only venues whose display name matches (case
-    insensitive, substring)."""
+    """Fetch venues live right now (bypassing the schedule) and reply with
+    just a screenshot per URL - no text summaries, so you can look at what's
+    actually on the page yourself. With no venue_query, peeks every venue;
+    otherwise only venues whose display name matches (case insensitive,
+    substring). Each URL gets exactly one photo, captioned only with the
+    venue and a one-word status so screenshots stay identifiable when a
+    venue has several URLs (BFI's 5 date windows)."""
     if venue_query:
         query = venue_query.strip().lower()
         matched = [w for w in watchers if query in w.display_name.lower()]
@@ -237,43 +239,21 @@ def handle_peek(watchers, venue_query: str = None):
 
     for watcher in watchers:
         for url in watcher.urls:
+            screenshot = None
+            status = "live"
             try:
-                html, screenshot = fetch_rendered_html(url, capture_screenshot=True)
+                _html, screenshot = fetch_rendered_html(url, capture_screenshot=True)
             except BlockedError as e:
-                notifier.send_message(f"{watcher.display_name}: blocked right now\n{e}\n{url}")
-                if e.screenshot:
-                    notifier.send_photo(
-                        e.screenshot, caption=f"{watcher.display_name} — live screenshot (blocked)"
-                    )
-                continue
+                screenshot = e.screenshot
+                status = "blocked"
             except FetchError as e:
-                notifier.send_message(f"{watcher.display_name}: fetch failed\n{e}\n{url}")
-                if e.screenshot:
-                    notifier.send_photo(
-                        e.screenshot, caption=f"{watcher.display_name} — live screenshot (fetch failed)"
-                    )
-                continue
-
-            try:
-                items = watcher.parse_url(url, html)
-            except ParseError as e:
-                notifier.send_message(f"{watcher.display_name}: parser broke\n{e}\n{url}")
-                if screenshot:
-                    notifier.send_photo(
-                        screenshot, caption=f"{watcher.display_name} — live screenshot (parse failed)"
-                    )
-                continue
-
-            if items:
-                lines = [f"{watcher.display_name} — live peek, {len(items)} items", url, ""]
-                for item_id, info in sorted(items.items()):
-                    lines.append(f"{item_id}: {info['status']}")
-                notifier.send_message("\n".join(lines))
-            else:
-                notifier.send_message(f"{watcher.display_name}: 0 items right now\n{url}")
+                screenshot = e.screenshot
+                status = "fetch failed"
 
             if screenshot:
-                notifier.send_photo(screenshot, caption=f"{watcher.display_name} — live screenshot")
+                notifier.send_photo(screenshot, caption=f"{watcher.display_name} — {status}")
+            else:
+                notifier.send_message(f"{watcher.display_name}: no screenshot available ({status}) for {url}")
 
 
 def handle_command(text: str, stats: Stats, watchers, run_control: RunControl):

@@ -3,6 +3,7 @@
 import logging
 import os
 import random
+import re
 import time
 
 from playwright.sync_api import sync_playwright
@@ -47,6 +48,54 @@ def _looks_blocked(title: str, lower_content: str) -> bool:
     return any(marker in title for marker in BLOCK_TITLE_MARKERS) or any(
         marker in lower_content for marker in BLOCK_CONTENT_MARKERS
     )
+
+
+# Science Museum sometimes routes visitors through a Queue-it virtual waiting
+# room before letting them through to the real page - identifiable by the
+# browser being redirected to a queue-it.net URL. This is not a broken parser
+# and not a bot-protection block; it clears on its own once your turn comes,
+# so it's waited out within the same page/session rather than raising
+# ParseError or retrying with a brand new session (which would just rejoin
+# the queue from scratch and never get through).
+QUEUE_IT_HOSTNAME_MARKER = "queue-it.net"
+QUEUE_POLL_INTERVAL_MS = 10000
+QUEUE_MAX_WAIT_MS = 5 * 60 * 1000
+# If left idle too long, Queue-it's default UI shows a "you still there?"
+# confirmation dialog ("Yes, please") that must be dismissed or it silently
+# drops you from the queue. Matched case-insensitively since the button may
+# render visually uppercase via CSS while the actual DOM text stays mixed
+# case; whitespace after the comma is flexible in case of minor rendering
+# differences, but the comma itself is required now that the exact text is
+# confirmed.
+QUEUE_STILL_THERE_TEXT_RE = re.compile(r"yes,\s*please", re.I)
+
+
+def _in_queue_it(page) -> bool:
+    return QUEUE_IT_HOSTNAME_MARKER in (page.url or "")
+
+
+def _wait_out_queue_it(page, url):
+    """If we've been redirected to a Queue-it waiting room, poll until it
+    releases us back to the real site (or give up past QUEUE_MAX_WAIT_MS)."""
+    if not _in_queue_it(page):
+        return
+    logger.info("%s: redirected to a Queue-it waiting room, waiting for it to clear", url)
+    waited_ms = 0
+    while _in_queue_it(page):
+        try:
+            page.get_by_text(QUEUE_STILL_THERE_TEXT_RE).click(timeout=1000)
+            logger.info("%s: dismissed Queue-it 'still there?' prompt", url)
+        except Exception:
+            pass  # prompt isn't showing right now, nothing to do
+        if waited_ms >= QUEUE_MAX_WAIT_MS:
+            screenshot = page.screenshot(full_page=True)
+            raise BlockedError(
+                f"Still in Queue-it queue after {waited_ms // 1000}s fetching {url}",
+                screenshot=screenshot,
+            )
+        page.wait_for_timeout(QUEUE_POLL_INTERVAL_MS)
+        waited_ms += QUEUE_POLL_INTERVAL_MS
+    logger.info("%s: Queue-it cleared after %ds", url, waited_ms // 1000)
 
 
 def _proxy_config():
@@ -124,6 +173,8 @@ def fetch_rendered_html(
             page = context.new_page()
             response = page.goto(url, timeout=timeout_ms)
             page.wait_for_timeout(wait_ms)
+
+            _wait_out_queue_it(page, url)
 
             try:
                 page.locator(COOKIE_ACCEPT_SELECTOR).click(timeout=3000)
