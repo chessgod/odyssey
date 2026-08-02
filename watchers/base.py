@@ -1,6 +1,8 @@
 """Shared fetch + diff logic for all watchers."""
 
 import logging
+import os
+import random
 import time
 
 from playwright.sync_api import sync_playwright
@@ -31,6 +33,44 @@ BLOCK_CONTENT_MARKERS = ("incapsula incident", "request unsuccessful")
 # Both target sites use the same OneTrust cookie consent banner, which
 # visually covers page content (and screenshots) until dismissed.
 COOKIE_ACCEPT_SELECTOR = "#onetrust-accept-btn-handler"
+
+# Cloudflare's non-interactive Turnstile challenge often clears itself within
+# a few extra seconds of JS execution in a real browser - so if the page
+# still looks blocked after the normal wait, give it a few more short polls
+# before giving up, instead of immediately declaring the attempt blocked.
+# Only kicks in when a page looks blocked; clean pages are unaffected.
+CHALLENGE_POLL_INTERVAL_MS = 3000
+CHALLENGE_MAX_EXTRA_WAIT_MS = 12000
+
+
+def _looks_blocked(title: str, lower_content: str) -> bool:
+    return any(marker in title for marker in BLOCK_TITLE_MARKERS) or any(
+        marker in lower_content for marker in BLOCK_CONTENT_MARKERS
+    )
+
+
+def _proxy_config():
+    """Optional proxy, off by default. Set PLAYWRIGHT_PROXY_SERVER (and
+    PLAYWRIGHT_PROXY_USERNAME/PLAYWRIGHT_PROXY_PASSWORD if it needs auth) in
+    .env to route fetches through it - useful if a datacenter IP's
+    reputation with a site's bot-protection ends up being the real blocker
+    rather than anything about the browser itself."""
+    server = os.environ.get("PLAYWRIGHT_PROXY_SERVER")
+    if not server:
+        return None
+    proxy = {"server": server}
+    username = os.environ.get("PLAYWRIGHT_PROXY_USERNAME")
+    password = os.environ.get("PLAYWRIGHT_PROXY_PASSWORD")
+    if username:
+        proxy["username"] = username
+    if password:
+        proxy["password"] = password
+    return proxy
+
+
+# Small random pause between fetching each of a venue's URLs within one
+# cycle, so requests don't land back-to-back in an obviously scripted burst.
+INTER_URL_DELAY_RANGE_SECONDS = (2, 6)
 
 
 class FetchError(Exception):
@@ -63,7 +103,10 @@ def fetch_rendered_html(
     useful for seeing what an unrecognized interstitial actually looks like.
     """
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(
+            args=["--disable-blink-features=AutomationControlled"],
+            proxy=_proxy_config(),
+        )
         try:
             context = browser.new_context(
                 user_agent=USER_AGENT,
@@ -71,6 +114,12 @@ def fetch_rendered_html(
                 timezone_id=BROWSER_TIMEZONE,
                 viewport=BROWSER_VIEWPORT,
                 extra_http_headers=EXTRA_HTTP_HEADERS,
+            )
+            # Chromium driven via CDP exposes navigator.webdriver=True by
+            # default, one of the simplest automation tells; hide it before
+            # any page script runs.
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
             page = context.new_page()
             response = page.goto(url, timeout=timeout_ms)
@@ -86,10 +135,21 @@ def fetch_rendered_html(
             title = (page.title() or "").strip().lower()
             content = page.content()
             lower_content = content.lower()
-            screenshot = page.screenshot(full_page=True) if capture_screenshot else None
 
             if status == 429:
+                screenshot = page.screenshot(full_page=True) if capture_screenshot else None
                 raise BlockedError(f"Rate limited (429) fetching {url}", screenshot=screenshot)
+
+            extra_waited_ms = 0
+            while _looks_blocked(title, lower_content) and extra_waited_ms < CHALLENGE_MAX_EXTRA_WAIT_MS:
+                page.wait_for_timeout(CHALLENGE_POLL_INTERVAL_MS)
+                extra_waited_ms += CHALLENGE_POLL_INTERVAL_MS
+                title = (page.title() or "").strip().lower()
+                content = page.content()
+                lower_content = content.lower()
+
+            screenshot = page.screenshot(full_page=True) if capture_screenshot else None
+
             if any(marker in title for marker in BLOCK_TITLE_MARKERS):
                 raise BlockedError(
                     f"Blocked by bot-protection challenge fetching {url} (title={title!r})",
@@ -125,21 +185,27 @@ class Watcher:
         raise NotImplementedError
 
     def check(self):
-        """Fetch + parse all URLs, merged into one combined item-set for this venue.
+        """Fetch + parse all URLs for this venue, kept separate per URL.
 
         Each URL gets up to RETRY_ATTEMPTS tries, spaced RETRY_WAIT_SECONDS
         apart, before giving up - a queue page, a slow-clearing challenge, or
         any other transient interstitial gets a real chance to resolve within
         the same cycle instead of immediately being treated as a failure.
 
-        Returns (combined_items, issues) where issues is a list of
-        (url, kind, message, screenshot_or_None) with kind in
-        {"fetch_failed", "blocked", "parse_broken"}. One URL failing does not
-        stop the others from being checked.
+        Returns (items_by_url, issues). items_by_url maps each URL that
+        succeeded this cycle to its parsed {item_id: info} dict - URLs that
+        failed entirely are simply absent, so callers can tell "this URL
+        contributed nothing this cycle" apart from "this URL's items are
+        genuinely empty". issues is a list of (url, kind, message,
+        screenshot_or_None) with kind in {"fetch_failed", "blocked",
+        "parse_broken"}. One URL failing does not stop the others from being
+        checked.
         """
-        combined = {}
+        items_by_url = {}
         issues = []
-        for url in self.urls:
+        for url_index, url in enumerate(self.urls):
+            if url_index > 0:
+                time.sleep(random.uniform(*INTER_URL_DELAY_RANGE_SECONDS))
             outcome = None  # (kind, message, screenshot)
             for attempt in range(1, RETRY_ATTEMPTS + 1):
                 is_last_attempt = attempt == RETRY_ATTEMPTS
@@ -152,15 +218,23 @@ class Watcher:
                     outcome = ("blocked", str(e), e.screenshot)
                 except FetchError as e:
                     outcome = ("fetch_failed", str(e), e.screenshot)
+                except Exception as e:
+                    # Anything unforeseen (e.g. a Playwright screenshot/navigation
+                    # timeout) - treat like any other failed attempt instead of
+                    # letting it escape check() entirely and silently skip the
+                    # whole venue for this cycle.
+                    outcome = ("fetch_failed", f"Unexpected error fetching {url}: {e!r}", None)
 
                 if html is not None:
                     try:
                         items = self.parse_url(url, html)
-                        combined.update(items)
+                        items_by_url[url] = items
                         outcome = None
                         break
                     except ParseError as e:
                         outcome = ("parse_broken", str(e), screenshot)
+                    except Exception as e:
+                        outcome = ("parse_broken", f"Unexpected parser error for {url}: {e!r}", screenshot)
 
                 if not is_last_attempt:
                     logger.info(
@@ -179,7 +253,7 @@ class Watcher:
                 issues.append((url, kind, message, screenshot))
                 logger.warning("%s: %s for %s: %s", self.name, kind, url, message)
 
-        return combined, issues
+        return items_by_url, issues
 
 
 def diff(old: dict, new: dict) -> list:

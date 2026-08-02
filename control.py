@@ -74,6 +74,11 @@ class Stats:
                     "last_success_time": None,
                     "last_issue_time": None,
                     "last_issue_message": None,
+                    # Whether an "still down" escalation has already been
+                    # sent for the *current* outage - reset on recovery so
+                    # a later outage can escalate again without repeating
+                    # every cycle in between.
+                    "escalated": False,
                 },
             )
 
@@ -111,6 +116,24 @@ class Stats:
     def record_cycle(self):
         with self._lock:
             self.cycles_completed += 1
+
+    def check_escalation(self, name: str, threshold_seconds: float) -> bool:
+        """Returns True (once) the first time a venue has gone threshold_seconds
+        without a successful check, so the caller can send a single "still
+        down" alert instead of staying silent through a long outage. Resets
+        on recovery so a later, separate outage can escalate again."""
+        with self._lock:
+            v = self.venues[name]
+            if v["last_check_outcome"] == "ok":
+                v["escalated"] = False
+                return False
+            if v["escalated"]:
+                return False
+            reference = v["last_success_time"] or self.start_time
+            if time.time() - reference >= threshold_seconds:
+                v["escalated"] = True
+                return True
+            return False
 
     def snapshot_text(self) -> str:
         with self._lock:

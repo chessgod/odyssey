@@ -10,6 +10,23 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_PHOTO_API_URL = "https://api.telegram.org/bot{token}/sendPhoto"
 
+# Telegram rejects sendMessage with 400 Bad Request above this many
+# characters. /status snapshots and parser-broken notices can embed several
+# long BFI search URLs and blow past it, silently dropping the whole message.
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+_TRUNCATION_SUFFIX = "\n… [truncated]"
+
+
+def _fit_to_telegram_limit(text: str) -> str:
+    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+        return text
+    logger.warning(
+        "Telegram message is %d chars, truncating to fit the %d-char limit",
+        len(text),
+        TELEGRAM_MAX_MESSAGE_LENGTH,
+    )
+    return text[: TELEGRAM_MAX_MESSAGE_LENGTH - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
+
 
 def send_message(text: str) -> bool:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -17,6 +34,8 @@ def send_message(text: str) -> bool:
     if not token or not chat_id:
         logger.error("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
         return False
+
+    text = _fit_to_telegram_limit(text)
 
     try:
         resp = requests.post(

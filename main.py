@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
 
 from dotenv import load_dotenv
@@ -22,6 +23,32 @@ LOG_FILE = os.path.join(LOG_DIR, "ticket_alerter.log")
 
 MAX_BACKOFF_MULTIPLIER = 4
 
+# How long a venue can go without a single successful check before we send
+# one "still down, might be worth a manual look" alert instead of staying
+# silent through the whole outage (Science Museum went 37h dark with zero
+# visibility on 2026-08-01/02).
+ESCALATION_THRESHOLD_SECONDS = 2 * 60 * 60
+
+
+def _log_uncaught_exception(exc_type, exc_value, exc_traceback):
+    """Route uncaught main-thread exceptions into the normal log handlers
+    instead of bare stderr - two process restarts in the first 2 days had no
+    corresponding traceback in this log file because of exactly that."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logging.getLogger(__name__).critical(
+        "Uncaught exception, process exiting", exc_info=(exc_type, exc_value, exc_traceback)
+    )
+
+
+def _log_uncaught_thread_exception(args):
+    logging.getLogger(__name__).critical(
+        "Uncaught exception in background thread %r",
+        args.thread.name,
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
 
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -33,6 +60,8 @@ def setup_logging():
             logging.StreamHandler(sys.stdout),
         ],
     )
+    sys.excepthook = _log_uncaught_exception
+    threading.excepthook = _log_uncaught_thread_exception
 
 
 def build_watchers():
@@ -42,6 +71,28 @@ def build_watchers():
     ]
 
 
+def _migrate_venue_state(value, urls):
+    """Old state format stored a venue's items as a flat {item_id: info}
+    dict with no record of which URLs had ever contributed. Wrap it in the
+    new {"items", "seen_urls"} format, treating every currently configured
+    URL as already seen - by the time this migration runs on an existing
+    state file, prior cycles already merged in whatever each URL had to
+    offer, so there's nothing to defer."""
+    if isinstance(value, dict) and "items" in value and "seen_urls" in value:
+        return value
+    return {"items": value, "seen_urls": list(urls)}
+
+
+def _maybe_send_escalation(stats, watcher):
+    if stats.check_escalation(watcher.name, ESCALATION_THRESHOLD_SECONDS):
+        hours = ESCALATION_THRESHOLD_SECONDS // 3600
+        notifier.send_message(
+            f"[ticket-alerter] {watcher.display_name} has had no successful check in "
+            f"over {hours}h — likely still blocked. Try /peek {watcher.display_name} "
+            "to check manually."
+        )
+
+
 def run_cycle(watchers, state, logger, stats) -> bool:
     """Run one check cycle for all watchers. Returns True if any fetch was blocked."""
     any_blocked = False
@@ -49,7 +100,7 @@ def run_cycle(watchers, state, logger, stats) -> bool:
     for watcher in watchers:
         stats.ensure_venue(watcher.name, watcher.display_name)
         try:
-            combined, issues = watcher.check()
+            items_by_url, issues = watcher.check()
         except Exception:
             logger.exception("%s: unexpected error during check, skipping this cycle", watcher.name)
             continue
@@ -66,33 +117,77 @@ def run_cycle(watchers, state, logger, stats) -> bool:
                         screenshot, caption=f"{watcher.display_name} — screenshot at time of failure"
                     )
 
-        old = state.get(watcher.name)
-        if old is None:
-            if not combined and issues:
+        combined = {}
+        for items in items_by_url.values():
+            combined.update(items)
+
+        venue_state = state.get(watcher.name)
+        if venue_state is not None:
+            venue_state = _migrate_venue_state(venue_state, watcher.urls)
+
+        if venue_state is None:
+            if not items_by_url and issues:
                 logger.warning(
                     "%s: no items fetched this cycle (all URLs failed), deferring baseline",
                     watcher.name,
                 )
                 stats.record_check(watcher.name, len(watcher.urls), 0, 0, issues)
+                _maybe_send_escalation(stats, watcher)
                 continue
-            state[watcher.name] = combined
-            logger.info("%s: baseline recorded (%d items)", watcher.name, len(combined))
+            state[watcher.name] = {"items": combined, "seen_urls": sorted(items_by_url.keys())}
+            logger.info(
+                "%s: baseline recorded (%d items, %d/%d URLs)",
+                watcher.name,
+                len(combined),
+                len(items_by_url),
+                len(watcher.urls),
+            )
             stats.record_check(watcher.name, len(watcher.urls), len(combined), 0, issues)
             continue
 
-        alerts = diff(old, combined)
+        old_items = venue_state["items"]
+        old_seen = set(venue_state["seen_urls"])
+
+        # Only diff URLs that have contributed a baseline before. A URL
+        # succeeding for the first time produces items that are new to *our
+        # records*, not necessarily new tickets - diffing those against a
+        # baseline that never had them is what caused the ~128 false "NEW"
+        # alert flood on 2026-08-01 (4 of 5 BFI date windows finally
+        # succeeding ~24h after the other one had already been baselined).
+        # Such URLs are merged into state silently instead, same as any
+        # other deferred baseline.
+        diffable = {}
+        newly_seen = []
+        for url, items in items_by_url.items():
+            if url in old_seen:
+                diffable.update(items)
+            else:
+                newly_seen.append(url)
+        if newly_seen:
+            logger.info(
+                "%s: %d URL(s) succeeded for the first time, merging without diffing: %s",
+                watcher.name,
+                len(newly_seen),
+                newly_seen,
+            )
+
+        alerts = diff(old_items, diffable)
         for msg in alerts:
             notifier.send_message(msg)
             logger.info("%s: alert sent: %s", watcher.name, msg.splitlines()[0])
 
-        # Only overwrite state with items we actually managed to fetch this
+        # Only overwrite items for URLs we actually managed to fetch this
         # cycle; keep prior entries for any URL that failed entirely.
-        if combined:
-            merged = dict(old)
-            merged.update(combined)
-            state[watcher.name] = merged
+        merged_items = dict(old_items)
+        for items in items_by_url.values():
+            merged_items.update(items)
+        state[watcher.name] = {
+            "items": merged_items,
+            "seen_urls": sorted(old_seen | set(items_by_url.keys())),
+        }
 
-        stats.record_check(watcher.name, len(watcher.urls), len(state[watcher.name]), len(alerts), issues)
+        stats.record_check(watcher.name, len(watcher.urls), len(merged_items), len(alerts), issues)
+        _maybe_send_escalation(stats, watcher)
 
         logger.info(
             "%s: checked (%d items, %d alerts, %d issues)",
