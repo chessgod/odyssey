@@ -14,7 +14,7 @@ import config
 import control
 import notifier
 import state as state_module
-from watchers.base import diff
+from watchers.base import decoy_browse, diff
 from watchers.bfi import BFIWatcher
 from watchers.science_museum import ScienceMuseumWatcher
 
@@ -66,9 +66,27 @@ def setup_logging():
 
 def build_watchers():
     return [
-        BFIWatcher(config.BFI_URLS),
-        ScienceMuseumWatcher(config.SCIENCE_MUSEUM_URLS),
+        BFIWatcher(config.BFI_URLS, config.BFI_DECOY_URLS),
+        ScienceMuseumWatcher(config.SCIENCE_MUSEUM_URLS, config.SCIENCE_MUSEUM_DECOY_URLS),
     ]
+
+
+def maybe_decoy_browse(watchers, logger) -> float:
+    """Sometimes (not every cycle - see config.DECOY_BROWSE_PROBABILITY),
+    spend part of the idle time between checks visiting a generic page on
+    one venue's site in a disposable browser session, so this IP's traffic
+    looks like a visitor poking around rather than a script that only ever
+    hits one exact URL on a fixed schedule. Returns seconds spent, so the
+    caller can subtract it from the normal sleep instead of stacking on top."""
+    candidates = [w for w in watchers if w.decoy_urls]
+    if not candidates or random.random() >= config.DECOY_BROWSE_PROBABILITY:
+        return 0.0
+    watcher = random.choice(candidates)
+    url = random.choice(watcher.decoy_urls)
+    logger.info("%s: decoy browse starting (%s)", watcher.name, url)
+    started = time.time()
+    decoy_browse(url)
+    return time.time() - started
 
 
 def _migrate_venue_state(value, urls):
@@ -225,6 +243,9 @@ def watch_loop(logger):
             -config.JITTER_SECONDS, config.JITTER_SECONDS
         )
         sleep_seconds = max(10, sleep_seconds) * backoff_multiplier
+
+        decoy_elapsed = maybe_decoy_browse(watchers, logger)
+        sleep_seconds = max(0, sleep_seconds - decoy_elapsed)
 
         logger.info("Cycle complete. Sleeping %.0fs (backoff x%d)", sleep_seconds, backoff_multiplier)
         time.sleep(sleep_seconds)

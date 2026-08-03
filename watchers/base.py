@@ -29,7 +29,16 @@ EXTRA_HTTP_HEADERS = {"Accept-Language": "en-GB,en;q=0.9"}
 UNAVAILABLE_STATUSES = {"sold_out"}
 
 BLOCK_TITLE_MARKERS = ("just a moment", "attention required", "access denied")
-BLOCK_CONTENT_MARKERS = ("incapsula incident", "request unsuccessful")
+# "additional security check"/"protected and accelerated by imperva" catch
+# Imperva's hCaptcha-backed challenge page for Science Museum, which has its
+# own title/copy - previously unrecognized, so it fell through to parse_url()
+# and got misreported as a broken parser instead of a block.
+BLOCK_CONTENT_MARKERS = (
+    "incapsula incident",
+    "request unsuccessful",
+    "additional security check",
+    "protected and accelerated by imperva",
+)
 
 # Both target sites use the same OneTrust cookie consent banner, which
 # visually covers page content (and screenshots) until dismissed.
@@ -96,6 +105,67 @@ def _wait_out_queue_it(page, url):
         page.wait_for_timeout(QUEUE_POLL_INTERVAL_MS)
         waited_ms += QUEUE_POLL_INTERVAL_MS
     logger.info("%s: Queue-it cleared after %ds", url, waited_ms // 1000)
+
+
+# BFI's block is Cloudflare Turnstile in interactive checkbox mode ("Verify
+# you are human"); Science Museum's is Imperva fronting an hCaptcha checkbox
+# ("I am human" - Imperva's own copy says just clicking it is enough, no
+# puzzle/image step). Both live inside a same-origin-restricted iframe from
+# the widget provider. This clicks the checkbox once, the same single
+# interaction a human visitor makes - not solving anything, no image/vision
+# work. If the widget isn't present, isn't loaded yet, or the click doesn't
+# actually clear the challenge, this is a no-op and the normal poll/wait/
+# retry handles it exactly as if this had never run.
+CAPTCHA_CHECKBOX_FRAME_SELECTORS = (
+    "iframe[src*='challenges.cloudflare.com']",  # Cloudflare Turnstile
+    "iframe[src*='hcaptcha.com']",  # hCaptcha (as used by Imperva here)
+)
+CAPTCHA_CHECKBOX_SELECTOR = "input[type=checkbox], #checkbox, [role=checkbox]"
+
+
+def _human_like_move_and_click(page, locator):
+    """Move the mouse to `locator` along a short, slightly wobbly multi-step
+    path with small pauses, then press and release - rather than an instant
+    teleport-click. A click with zero prior mouse movement is itself a
+    behavioral bot signal to these widgets; this presents a more honest
+    (if approximate) human interaction instead. Falls back to a plain click
+    if a bounding box isn't available for any reason."""
+    box = locator.bounding_box()
+    if not box:
+        locator.click(timeout=2000)
+        return
+
+    target_x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+    target_y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+    start_x = target_x + random.uniform(-250, 250)
+    start_y = target_y + random.uniform(-150, 150)
+    page.mouse.move(start_x, start_y)
+
+    waypoints = random.randint(2, 4)
+    for i in range(1, waypoints + 1):
+        x = start_x + (target_x - start_x) * (i / waypoints) + random.uniform(-15, 15)
+        y = start_y + (target_y - start_y) * (i / waypoints) + random.uniform(-15, 15)
+        page.mouse.move(x, y, steps=random.randint(3, 8))
+        page.wait_for_timeout(random.randint(40, 150))
+
+    page.mouse.move(target_x, target_y, steps=random.randint(3, 6))
+    page.wait_for_timeout(random.randint(150, 450))  # brief hover before acting
+    page.mouse.down()
+    page.wait_for_timeout(random.randint(40, 120))
+    page.mouse.up()
+
+
+def _click_captcha_checkbox(page, url):
+    for frame_selector in CAPTCHA_CHECKBOX_FRAME_SELECTORS:
+        try:
+            locator = page.frame_locator(frame_selector).locator(CAPTCHA_CHECKBOX_SELECTOR).first
+            locator.wait_for(state="visible", timeout=2000)
+            page.wait_for_timeout(random.randint(500, 2000))  # a beat before acting, like noticing the page
+            _human_like_move_and_click(page, locator)
+            logger.info("%s: clicked a captcha checkbox (%s)", url, frame_selector)
+            return
+        except Exception:
+            continue  # widget not present, not loaded yet, or not clickable right now
 
 
 def _proxy_config():
@@ -191,6 +261,9 @@ def fetch_rendered_html(
                 screenshot = page.screenshot(full_page=True) if capture_screenshot else None
                 raise BlockedError(f"Rate limited (429) fetching {url}", screenshot=screenshot)
 
+            if _looks_blocked(title, lower_content):
+                _click_captcha_checkbox(page, url)
+
             extra_waited_ms = 0
             while _looks_blocked(title, lower_content) and extra_waited_ms < CHALLENGE_MAX_EXTRA_WAIT_MS:
                 page.wait_for_timeout(CHALLENGE_POLL_INTERVAL_MS)
@@ -218,6 +291,54 @@ def fetch_rendered_html(
             browser.close()
 
 
+DECOY_DWELL_MS_RANGE = (8000, 25000)
+
+
+def decoy_browse(url: str) -> None:
+    """Best-effort: visit a generic, non-ticketing page on the same site and
+    linger a bit, purely so this IP's traffic looks like a visitor poking
+    around rather than a script that only ever hits one exact URL on a fixed
+    schedule. Always its own disposable browser session, deliberately never
+    chained into a real ticket-check session - BFI's booking backend was
+    previously found to trigger Turnstile *more* aggressively on same-session
+    navigation (see BFI_URLS' comment in config.py). Never raises - any
+    failure here is silently logged and ignored, since this is optional
+    traffic-pattern hygiene, not part of the actual ticket-checking path."""
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                args=["--disable-blink-features=AutomationControlled"],
+                proxy=_proxy_config(),
+            )
+            try:
+                context = browser.new_context(
+                    user_agent=USER_AGENT,
+                    locale=BROWSER_LOCALE,
+                    timezone_id=BROWSER_TIMEZONE,
+                    viewport=BROWSER_VIEWPORT,
+                    extra_http_headers=EXTRA_HTTP_HEADERS,
+                )
+                context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
+                page = context.new_page()
+                page.goto(url, timeout=20000)
+
+                dwell_ms = random.randint(*DECOY_DWELL_MS_RANGE)
+                page.wait_for_timeout(dwell_ms // 3)
+                try:
+                    page.mouse.wheel(0, random.randint(200, 800))
+                except Exception:
+                    pass  # scroll is a nice-to-have, not essential
+                page.wait_for_timeout(dwell_ms - dwell_ms // 3)
+
+                logger.info("decoy browse: visited %s for ~%dms", url, dwell_ms)
+            finally:
+                browser.close()
+    except Exception as e:
+        logger.info("decoy browse: failed for %s, ignoring (%r)", url, e)
+
+
 RETRY_ATTEMPTS = 3
 RETRY_WAIT_SECONDS = 15
 
@@ -228,8 +349,9 @@ class Watcher:
     name = "base"
     display_name = "Base"
 
-    def __init__(self, urls):
+    def __init__(self, urls, decoy_urls=None):
         self.urls = urls
+        self.decoy_urls = decoy_urls or []
 
     def parse_url(self, url: str, html: str) -> dict:
         """Return {item_id: {"status": str, "label": str, "url": str}} for one page."""

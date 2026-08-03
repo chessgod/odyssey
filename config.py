@@ -47,3 +47,23 @@ SCIENCE_MUSEUM_URLS = [
 # as valid availability data. Case-insensitive.
 BFI_EXPECTED_KEYWORD = "odyssey"
 SCIENCE_MUSEUM_EXPECTED_KEYWORD = "odyssey"
+
+# Generic, non-ticketing pages on each site's own protected zone, used for
+# occasional decoy browsing between checks (see main.py: maybe_decoy_browse)
+# so this IP's traffic looks like a visitor poking around the site, not a
+# script that only ever hits one exact URL on a fixed schedule. Verified
+# live on 2026-08-03 to load cleanly without tripping either site's
+# challenge. Deliberately NOT chained into the same browser session as an
+# actual ticket check - see the note on BFI_URLS above about same-session
+# navigation triggering Turnstile more aggressively; decoy_browse() always
+# runs as its own disposable session instead.
+BFI_DECOY_URLS = [
+    "https://whatson.bfi.org.uk/imax/Online/article/imax70mm",
+]
+SCIENCE_MUSEUM_DECOY_URLS = [
+    "https://my.sciencemuseum.org.uk/",
+]
+
+# Fraction of cycles that spend part of the idle wait on a decoy browse
+# instead of just sleeping - "sometimes, not every time" is the point.
+DECOY_BROWSE_PROBABILITY = 0.4
