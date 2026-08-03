@@ -110,16 +110,19 @@ def _wait_out_queue_it(page, url):
 # BFI's block is Cloudflare Turnstile in interactive checkbox mode ("Verify
 # you are human"); Science Museum's is Imperva fronting an hCaptcha checkbox
 # ("I am human" - Imperva's own copy says just clicking it is enough, no
-# puzzle/image step). Both live inside a same-origin-restricted iframe from
-# the widget provider. This clicks the checkbox once, the same single
+# puzzle/image step). This clicks the checkbox once, the same single
 # interaction a human visitor makes - not solving anything, no image/vision
 # work. If the widget isn't present, isn't loaded yet, or the click doesn't
 # actually clear the challenge, this is a no-op and the normal poll/wait/
 # retry handles it exactly as if this had never run.
-CAPTCHA_CHECKBOX_FRAME_SELECTORS = (
-    "iframe[src*='challenges.cloudflare.com']",  # Cloudflare Turnstile
-    "iframe[src*='hcaptcha.com']",  # hCaptcha (as used by Imperva here)
-)
+#
+# Earlier version targeted specific iframe src patterns one level deep
+# (iframe[src*='challenges.cloudflare.com'], iframe[src*='hcaptcha.com']) and
+# didn't reliably find/click the checkbox in production. The exact DOM
+# nesting for these widgets isn't guaranteed stable or knowable without live
+# inspection, so instead of guessing a src pattern or nesting depth, this
+# searches *every* frame on the page (page.frames flattens all nesting
+# levels) for anything checkbox-shaped.
 CAPTCHA_CHECKBOX_SELECTOR = "input[type=checkbox], #checkbox, [role=checkbox]"
 
 
@@ -155,17 +158,24 @@ def _human_like_move_and_click(page, locator):
     page.mouse.up()
 
 
-def _click_captcha_checkbox(page, url):
-    for frame_selector in CAPTCHA_CHECKBOX_FRAME_SELECTORS:
+def _click_captcha_checkbox(page, url) -> bool:
+    """Look through every frame on the page for a checkbox-like element and
+    click it once via _human_like_move_and_click. Returns True if something
+    was clicked (so the caller doesn't need to keep retrying), False if no
+    frame had a clickable checkbox this attempt - never raises."""
+    frames = page.frames
+    logger.info("%s: looking for a captcha checkbox across %d frame(s)", url, len(frames))
+    for frame in frames:
         try:
-            locator = page.frame_locator(frame_selector).locator(CAPTCHA_CHECKBOX_SELECTOR).first
-            locator.wait_for(state="visible", timeout=2000)
-            page.wait_for_timeout(random.randint(500, 2000))  # a beat before acting, like noticing the page
+            locator = frame.locator(CAPTCHA_CHECKBOX_SELECTOR).first
+            locator.wait_for(state="visible", timeout=1500)
+            page.wait_for_timeout(random.randint(300, 1200))  # a beat before acting
             _human_like_move_and_click(page, locator)
-            logger.info("%s: clicked a captcha checkbox (%s)", url, frame_selector)
-            return
-        except Exception:
-            continue  # widget not present, not loaded yet, or not clickable right now
+            logger.info("%s: clicked a captcha checkbox (frame: %s)", url, frame.url)
+            return True
+        except Exception as e:
+            logger.info("%s: no clickable checkbox in frame %s (%s)", url, frame.url, e)
+    return False
 
 
 def _proxy_config():
@@ -261,11 +271,17 @@ def fetch_rendered_html(
                 screenshot = page.screenshot(full_page=True) if capture_screenshot else None
                 raise BlockedError(f"Rate limited (429) fetching {url}", screenshot=screenshot)
 
+            checkbox_clicked = False
             if _looks_blocked(title, lower_content):
-                _click_captcha_checkbox(page, url)
+                checkbox_clicked = _click_captcha_checkbox(page, url)
 
             extra_waited_ms = 0
             while _looks_blocked(title, lower_content) and extra_waited_ms < CHALLENGE_MAX_EXTRA_WAIT_MS:
+                # The widget may not have rendered yet on the first attempt
+                # above - keep trying each poll until something actually
+                # gets clicked, then stop (no need to keep re-clicking).
+                if not checkbox_clicked:
+                    checkbox_clicked = _click_captcha_checkbox(page, url)
                 page.wait_for_timeout(CHALLENGE_POLL_INTERVAL_MS)
                 extra_waited_ms += CHALLENGE_POLL_INTERVAL_MS
                 title = (page.title() or "").strip().lower()
@@ -353,6 +369,13 @@ class Watcher:
         self.urls = urls
         self.decoy_urls = decoy_urls or []
 
+    def refresh_urls(self):
+        """Override for watchers whose URLs are date-based and need
+        recomputing before every check (see BFIWatcher/ScienceMuseumWatcher),
+        so a long-running process never needs restarting to pick up a new
+        day. No-op by default - self.urls stays whatever was passed in."""
+        pass
+
     def parse_url(self, url: str, html: str) -> dict:
         """Return {item_id: {"status": str, "label": str, "url": str}} for one page."""
         raise NotImplementedError
@@ -365,15 +388,19 @@ class Watcher:
         any other transient interstitial gets a real chance to resolve within
         the same cycle instead of immediately being treated as a failure.
 
-        Returns (items_by_url, issues). items_by_url maps each URL that
-        succeeded this cycle to its parsed {item_id: info} dict - URLs that
-        failed entirely are simply absent, so callers can tell "this URL
-        contributed nothing this cycle" apart from "this URL's items are
-        genuinely empty". issues is a list of (url, kind, message,
-        screenshot_or_None) with kind in {"fetch_failed", "blocked",
-        "parse_broken"}. One URL failing does not stop the others from being
-        checked.
+        Returns (items_by_url, issues). items_by_url maps each URL's stable
+        *window index* (not the literal URL string - BFI/Science Museum's
+        URLs embed today's date and change daily, so a literal URL is never
+        the same twice; the index is what main.py uses to track "have we
+        ever gotten a baseline for this window" across days) to its parsed
+        {item_id: info} dict for windows that succeeded this cycle - windows
+        that failed entirely are simply absent. issues is a list of (url,
+        kind, message, screenshot_or_None) with kind in {"fetch_failed",
+        "blocked", "parse_broken"}, keyed by the literal URL since that's
+        what's useful in a log line or Telegram message. One URL failing
+        does not stop the others from being checked.
         """
+        self.refresh_urls()
         items_by_url = {}
         issues = []
         for url_index, url in enumerate(self.urls):
@@ -401,7 +428,7 @@ class Watcher:
                 if html is not None:
                     try:
                         items = self.parse_url(url, html)
-                        items_by_url[url] = items
+                        items_by_url[url_index] = items
                         outcome = None
                         break
                     except ParseError as e:

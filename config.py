@@ -1,17 +1,23 @@
 """Non-secret configuration: target URLs, poll interval, jitter."""
 
+import datetime
+
 CHECK_INTERVAL_SECONDS = 180  # ~3 minutes
 JITTER_SECONDS = 45  # random +/- jitter applied to each interval
 
-#   Each URL is a date-range-filtered BFI search, loaded as a fresh
-#   top-level navigation. Turnstile only seems to trigger on navigating to
-#   the search backend *within* a session that already loaded another page
-#   (pagination links, date-filter clicks) — a brand new session going
-#   straight to a search URL loads cleanly. Windows are sized to stay
-#   comfortably under the 50-result page-size limit based on live testing
-#   on 2026-07-31 (watchers/bfi.py alerts if a window ever fills up, rather
-#   than silently truncating); review/adjust these as dates pass or BFI's
-#   schedule changes.
+# Each URL is a date-range-filtered BFI search, loaded as a fresh top-level
+# navigation. Turnstile only seems to trigger on navigating to the search
+# backend *within* a session that already loaded another page (pagination
+# links, date-filter clicks) — a brand new session going straight to a
+# search URL loads cleanly. Windows are sized to stay comfortably under the
+# 50-result page-size limit based on live testing on 2026-07-31
+# (watchers/bfi.py alerts if a window ever fills up, rather than silently
+# truncating). The *dates* are computed fresh from today() on every call to
+# bfi_urls() below - hardcoding a fixed start date meant it went stale
+# within days and had to be hand-edited, which also meant a stale window got
+# searched (useless, and an odd-looking query for a real visitor to make).
+# Only the window *sizes* in _BFI_WINDOW_DAY_OFFSETS need revisiting if
+# BFI's schedule gets denser.
 _BFI_ARTICLE_SEARCH_ID = "49C49C83-6BA0-420C-A784-9B485E36E2E0"
 _BFI_SEARCH_URL_TEMPLATE = (
     "https://whatson.bfi.org.uk/imax/Online/default.asp?"
@@ -28,18 +34,40 @@ _BFI_SEARCH_URL_TEMPLATE = (
     "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_from={frm}&"
     "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_to={to}"
 )
-BFI_DATE_WINDOWS = [
-    ("2026-7-29", "2026-8-7"),
-    ("2026-8-8", "2026-8-17"),
-    ("2026-8-18", "2026-8-27"),
-    ("2026-8-28", "2026-9-30"),
-    ("2026-10-1", "2027-12-31"),
-]
-BFI_URLS = [_BFI_SEARCH_URL_TEMPLATE.format(frm=frm, to=to) for frm, to in BFI_DATE_WINDOWS]
+# (start_offset, end_offset) in days-from-today for each window - same
+# 10/10/10/~35-day/long-tail spacing as the original hand-picked windows,
+# just anchored to "today" instead of a fixed date so it never goes stale.
+_BFI_WINDOW_DAY_OFFSETS = [(0, 10), (10, 20), (20, 30), (30, 65), (65, 730)]
 
-SCIENCE_MUSEUM_URLS = [
-    "https://my.sciencemuseum.org.uk/events?view=calendar&kid=794&startdate=01-07-2026",
-]
+
+def _fmt_bfi_date(d: datetime.date) -> str:
+    """BFI's search backend expects "{year}-{month}-{day}" with no leading
+    zeros (confirmed against previously-working values, e.g. "2026-8-7").
+    Built manually rather than via strftime's no-padding flags (%-d), which
+    aren't portable to Windows."""
+    return f"{d.year}-{d.month}-{d.day}"
+
+
+def bfi_urls(today: datetime.date = None) -> list:
+    """The 5 BFI search URLs, with date windows computed fresh from today
+    (or the given date, for testing) so this never needs manual updating."""
+    today = today or datetime.date.today()
+    windows = [
+        (today + datetime.timedelta(days=start), today + datetime.timedelta(days=end - 1))
+        for start, end in _BFI_WINDOW_DAY_OFFSETS
+    ]
+    return [
+        _BFI_SEARCH_URL_TEMPLATE.format(frm=_fmt_bfi_date(frm), to=_fmt_bfi_date(to))
+        for frm, to in windows
+    ]
+
+
+def science_museum_urls(today: datetime.date = None) -> list:
+    """The Science Museum calendar URL, with startdate computed fresh from
+    today (or the given date, for testing) for the same reason as above."""
+    today = today or datetime.date.today()
+    startdate = today.strftime("%d-%m-%Y")  # DD-MM-YYYY, the UK site's native format
+    return [f"https://my.sciencemuseum.org.uk/events?view=calendar&kid=794&startdate={startdate}"]
 
 # Sanity-check keyword each parser looks for in the fetched page/items before
 # trusting its data. Guards against silently treating a wrong or unexpected
@@ -54,7 +82,7 @@ SCIENCE_MUSEUM_EXPECTED_KEYWORD = "odyssey"
 # script that only ever hits one exact URL on a fixed schedule. Verified
 # live on 2026-08-03 to load cleanly without tripping either site's
 # challenge. Deliberately NOT chained into the same browser session as an
-# actual ticket check - see the note on BFI_URLS above about same-session
+# actual ticket check - see the note on bfi_urls() above about same-session
 # navigation triggering Turnstile more aggressively; decoy_browse() always
 # runs as its own disposable session instead.
 BFI_DECOY_URLS = [

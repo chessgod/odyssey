@@ -66,8 +66,8 @@ def setup_logging():
 
 def build_watchers():
     return [
-        BFIWatcher(config.BFI_URLS, config.BFI_DECOY_URLS),
-        ScienceMuseumWatcher(config.SCIENCE_MUSEUM_URLS, config.SCIENCE_MUSEUM_DECOY_URLS),
+        BFIWatcher(config.bfi_urls(), config.BFI_DECOY_URLS),
+        ScienceMuseumWatcher(config.science_museum_urls(), config.SCIENCE_MUSEUM_DECOY_URLS),
     ]
 
 
@@ -90,15 +90,29 @@ def maybe_decoy_browse(watchers, logger) -> float:
 
 
 def _migrate_venue_state(value, urls):
-    """Old state format stored a venue's items as a flat {item_id: info}
-    dict with no record of which URLs had ever contributed. Wrap it in the
-    new {"items", "seen_urls"} format, treating every currently configured
-    URL as already seen - by the time this migration runs on an existing
-    state file, prior cycles already merged in whatever each URL had to
-    offer, so there's nothing to defer."""
-    if isinstance(value, dict) and "items" in value and "seen_urls" in value:
-        return value
-    return {"items": value, "seen_urls": list(urls)}
+    """Two migrations in one, both idempotent - safe to run on every load
+    regardless of which format the state is already in:
+
+    1. Old flat {item_id: info} format (pre session-3) -> wrap as
+       {"items": ..., "seen_urls": [...]}.
+    2. seen_urls keyed by literal URL string (session-3's original scheme)
+       -> re-keyed by window *index* instead. BFI/Science Museum's URLs now
+       embed today's date and change daily (see config.bfi_urls), so a
+       literal URL is never the same twice - left as URL-keyed, this would
+       silently disable diffing entirely, since every window would look
+       "never seen before" on every single day.
+
+    Both migrations mark every currently configured window as already seen,
+    on the same reasoning as the original migration: if state got this far,
+    prior cycles already merged in whatever each window had to offer.
+    """
+    all_indices = list(range(len(urls)))
+    if not (isinstance(value, dict) and "items" in value and "seen_urls" in value):
+        return {"items": value, "seen_urls": all_indices}
+    seen = value["seen_urls"]
+    if seen and not all(isinstance(s, int) for s in seen):
+        return {"items": value["items"], "seen_urls": all_indices}
+    return value
 
 
 def _maybe_send_escalation(stats, watcher):
@@ -176,17 +190,17 @@ def run_cycle(watchers, state, logger, stats) -> bool:
         # other deferred baseline.
         diffable = {}
         newly_seen = []
-        for url, items in items_by_url.items():
-            if url in old_seen:
+        for idx, items in items_by_url.items():
+            if idx in old_seen:
                 diffable.update(items)
             else:
-                newly_seen.append(url)
+                newly_seen.append(idx)
         if newly_seen:
             logger.info(
-                "%s: %d URL(s) succeeded for the first time, merging without diffing: %s",
+                "%s: %d window(s) succeeded for the first time, merging without diffing: %s",
                 watcher.name,
                 len(newly_seen),
-                newly_seen,
+                [watcher.urls[i] for i in newly_seen],
             )
 
         alerts = diff(old_items, diffable)

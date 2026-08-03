@@ -37,6 +37,9 @@ class BFIWatcher(Watcher):
     name = "bfi"
     display_name = "BFI"
 
+    def refresh_urls(self):
+        self.urls = config.bfi_urls()
+
     def parse_url(self, url: str, html: str) -> dict:
         title_match = TITLE_RE.search(html)
         title = title_match.group(1).strip() if title_match else ""
