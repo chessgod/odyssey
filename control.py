@@ -303,6 +303,7 @@ def handle_command(text: str, stats: Stats, watchers, run_control: RunControl):
     elif command == "/restart":
         notifier.send_message("Restarting...")
         perform_restart()
+        notifier.send_message("Restarted.")
     elif command == "/help":
         notifier.send_message(HELP_TEXT)
     else:
