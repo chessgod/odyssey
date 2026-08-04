@@ -126,20 +126,12 @@ def _wait_out_queue_it(page, url):
 CAPTCHA_CHECKBOX_SELECTOR = "input[type=checkbox], #checkbox, [role=checkbox]"
 
 
-def _human_like_move_and_click(page, locator):
-    """Move the mouse to `locator` along a short, slightly wobbly multi-step
-    path with small pauses, then press and release - rather than an instant
-    teleport-click. A click with zero prior mouse movement is itself a
-    behavioral bot signal to these widgets; this presents a more honest
-    (if approximate) human interaction instead. Falls back to a plain click
-    if a bounding box isn't available for any reason."""
-    box = locator.bounding_box()
-    if not box:
-        locator.click(timeout=2000)
-        return
-
-    target_x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
-    target_y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+def _human_like_move_and_click_point(page, target_x, target_y):
+    """Move the mouse to (target_x, target_y) along a short, slightly wobbly
+    multi-step path with small pauses, then press and release - rather than
+    an instant teleport-click. A click with zero prior mouse movement is
+    itself a behavioral bot signal to these widgets; this presents a more
+    honest (if approximate) human interaction instead."""
     start_x = target_x + random.uniform(-250, 250)
     start_y = target_y + random.uniform(-150, 150)
     page.mouse.move(start_x, start_y)
@@ -158,11 +150,40 @@ def _human_like_move_and_click(page, locator):
     page.mouse.up()
 
 
+def _human_like_move_and_click(page, locator):
+    """Same as _human_like_move_and_click_point, targeting the center-ish of
+    `locator`'s bounding box. Falls back to a plain click if a bounding box
+    isn't available for any reason."""
+    box = locator.bounding_box()
+    if not box:
+        locator.click(timeout=2000)
+        return
+    target_x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+    target_y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+    _human_like_move_and_click_point(page, target_x, target_y)
+
+
+# If it's not the checkbox in the top-left of the widget, it's within this
+# range - both Turnstile's and hCaptcha's standard layout put the checkbox
+# near the left edge of their own iframe, with label text to its right, so
+# this is a reasonable target regardless of the widget's exact DOM/class
+# names (which aren't discoverable without live inspection).
+WIDGET_CHECKBOX_X_FRACTION_RANGE = (0.06, 0.14)
+WIDGET_CHECKBOX_Y_FRACTION_RANGE = (0.4, 0.6)
+WIDGET_IFRAME_MIN_SIZE = (50, 20)  # (width, height) px - filters out trackers/other tiny iframes
+
+
 def _click_captcha_checkbox(page, url) -> bool:
     """Look through every frame on the page for a checkbox-like element and
     click it once via _human_like_move_and_click. Returns True if something
-    was clicked (so the caller doesn't need to keep retrying), False if no
-    frame had a clickable checkbox this attempt - never raises."""
+    was clicked (so the caller doesn't need to keep retrying), False if
+    nothing was clicked this attempt - never raises.
+
+    If no frame has a specifically-selectable checkbox (confirmed to happen
+    in production against real Turnstile/hCaptcha pages - CAPTCHA_CHECKBOX_
+    SELECTOR simply doesn't match either widget's actual markup), falls back
+    to clicking near the left edge of each candidate iframe directly instead
+    of giving up."""
     frames = page.frames
     logger.info("%s: looking for a captcha checkbox across %d frame(s)", url, len(frames))
     for frame in frames:
@@ -175,6 +196,27 @@ def _click_captcha_checkbox(page, url) -> bool:
             return True
         except Exception as e:
             logger.info("%s: no clickable checkbox in frame %s (%s)", url, frame.url, e)
+
+    for frame in frames:
+        if frame == page.main_frame:
+            continue  # not a widget iframe, skip
+        try:
+            box = frame.frame_element().bounding_box()
+            if not box or box["width"] < WIDGET_IFRAME_MIN_SIZE[0] or box["height"] < WIDGET_IFRAME_MIN_SIZE[1]:
+                continue
+            target_x = box["x"] + box["width"] * random.uniform(*WIDGET_CHECKBOX_X_FRACTION_RANGE)
+            target_y = box["y"] + box["height"] * random.uniform(*WIDGET_CHECKBOX_Y_FRACTION_RANGE)
+            page.wait_for_timeout(random.randint(300, 1200))
+            _human_like_move_and_click_point(page, target_x, target_y)
+            logger.info(
+                "%s: no checkbox element found - clicked near the left edge of widget iframe %s instead",
+                url,
+                frame.url,
+            )
+            return True
+        except Exception as e:
+            logger.info("%s: couldn't click widget iframe %s (%s)", url, frame.url, e)
+
     return False
 
 
@@ -222,87 +264,157 @@ class ParseError(Exception):
     retried the same way before this is treated as worth alerting on."""
 
 
+def _new_context_init_script(context):
+    # Chromium driven via CDP exposes navigator.webdriver=True by default,
+    # one of the simplest automation tells; hide it before any page script
+    # runs.
+    context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+
+
+def open_persistent_context(user_data_dir: str):
+    """Launch a Chromium browser backed by a real, disk-stored profile
+    directory that's kept alive and reused across the whole watch loop's
+    lifetime, instead of a brand new, zero-history browser being launched
+    fresh for every single fetch (the previous behavior, still used by
+    fetch_rendered_html() when no context is passed in - see below).
+
+    A completely empty-cookie, empty-history browser hitting a protected
+    ticketing endpoint directly, over and over, forever, is itself an
+    unusual pattern a real long-term visitor doesn't have. Confirmed
+    2026-08-03: a normal manual browser session on the same network hit no
+    captcha at all, while the per-request-fresh automated session kept
+    getting one - the persistent profile lets Cloudflare/Imperva clearance
+    cookies (and just general browsing history) actually accumulate and
+    carry over between checks, the way a real user's browser would.
+
+    Returns (playwright, context) - both must be kept alive by the caller
+    for as long as the context is in use, and closed together via
+    close_persistent_context() on shutdown.
+    """
+    playwright = sync_playwright().start()
+    context = playwright.chromium.launch_persistent_context(
+        user_data_dir,
+        headless=True,
+        args=["--disable-blink-features=AutomationControlled"],
+        proxy=_proxy_config(),
+        user_agent=USER_AGENT,
+        locale=BROWSER_LOCALE,
+        timezone_id=BROWSER_TIMEZONE,
+        viewport=BROWSER_VIEWPORT,
+        extra_http_headers=EXTRA_HTTP_HEADERS,
+    )
+    _new_context_init_script(context)
+    return playwright, context
+
+
+def close_persistent_context(playwright, context):
+    try:
+        context.close()
+    finally:
+        playwright.stop()
+
+
+def _fetch_with_page(page, url: str, wait_ms: int, timeout_ms: int, capture_screenshot: bool):
+    """Shared fetch logic given an already-open page. Does not create or
+    close any browser/context/page - that's the caller's responsibility, so
+    the same logic works whether the page came from a short-lived context
+    (fetch_rendered_html's default) or a long-lived persistent one."""
+    response = page.goto(url, timeout=timeout_ms)
+    page.wait_for_timeout(wait_ms)
+
+    _wait_out_queue_it(page, url)
+
+    try:
+        page.locator(COOKIE_ACCEPT_SELECTOR).click(timeout=3000)
+        page.wait_for_timeout(500)
+    except Exception:
+        pass  # no cookie banner present, or it didn't appear in time
+
+    status = response.status if response else None
+    title = (page.title() or "").strip().lower()
+    content = page.content()
+    lower_content = content.lower()
+
+    if status == 429:
+        screenshot = page.screenshot(full_page=True) if capture_screenshot else None
+        raise BlockedError(f"Rate limited (429) fetching {url}", screenshot=screenshot)
+
+    checkbox_clicked = False
+    if _looks_blocked(title, lower_content):
+        checkbox_clicked = _click_captcha_checkbox(page, url)
+
+    extra_waited_ms = 0
+    while _looks_blocked(title, lower_content) and extra_waited_ms < CHALLENGE_MAX_EXTRA_WAIT_MS:
+        # The widget may not have rendered yet on the first attempt above -
+        # keep trying each poll until something actually gets clicked, then
+        # stop (no need to keep re-clicking).
+        if not checkbox_clicked:
+            checkbox_clicked = _click_captcha_checkbox(page, url)
+        page.wait_for_timeout(CHALLENGE_POLL_INTERVAL_MS)
+        extra_waited_ms += CHALLENGE_POLL_INTERVAL_MS
+        title = (page.title() or "").strip().lower()
+        content = page.content()
+        lower_content = content.lower()
+
+    screenshot = page.screenshot(full_page=True) if capture_screenshot else None
+
+    if any(marker in title for marker in BLOCK_TITLE_MARKERS):
+        raise BlockedError(
+            f"Blocked by bot-protection challenge fetching {url} (title={title!r})",
+            screenshot=screenshot,
+        )
+    if any(marker in lower_content for marker in BLOCK_CONTENT_MARKERS):
+        raise BlockedError(f"Blocked by bot-protection challenge fetching {url}", screenshot=screenshot)
+    if status is not None and status >= 400:
+        raise FetchError(f"HTTP {status} fetching {url}", screenshot=screenshot)
+
+    return content, screenshot
+
+
 def fetch_rendered_html(
-    url: str, wait_ms: int = 6000, timeout_ms: int = 30000, capture_screenshot: bool = False
+    url: str,
+    wait_ms: int = 6000,
+    timeout_ms: int = 30000,
+    capture_screenshot: bool = False,
+    context=None,
 ):
     """Fetch a URL with a real browser, return (html, screenshot_bytes_or_None).
 
     The screenshot is captured before any block check, so it's available on
     BlockedError/FetchError too (via the exception's .screenshot attribute) -
     useful for seeing what an unrecognized interstitial actually looks like.
+
+    If `context` is given (a persistent context from open_persistent_context),
+    it's reused as-is - only a new page is opened/closed here, so cookies and
+    history carry over between calls. Otherwise (the default, used by /peek
+    and decoy browsing) falls back to the original behavior: a brand new,
+    throwaway browser+context is launched and torn down for this one fetch.
     """
+    if context is not None:
+        page = context.new_page()
+        try:
+            return _fetch_with_page(page, url, wait_ms, timeout_ms, capture_screenshot)
+        finally:
+            page.close()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             args=["--disable-blink-features=AutomationControlled"],
             proxy=_proxy_config(),
         )
         try:
-            context = browser.new_context(
+            fresh_context = browser.new_context(
                 user_agent=USER_AGENT,
                 locale=BROWSER_LOCALE,
                 timezone_id=BROWSER_TIMEZONE,
                 viewport=BROWSER_VIEWPORT,
                 extra_http_headers=EXTRA_HTTP_HEADERS,
             )
-            # Chromium driven via CDP exposes navigator.webdriver=True by
-            # default, one of the simplest automation tells; hide it before
-            # any page script runs.
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
-            page = context.new_page()
-            response = page.goto(url, timeout=timeout_ms)
-            page.wait_for_timeout(wait_ms)
-
-            _wait_out_queue_it(page, url)
-
-            try:
-                page.locator(COOKIE_ACCEPT_SELECTOR).click(timeout=3000)
-                page.wait_for_timeout(500)
-            except Exception:
-                pass  # no cookie banner present, or it didn't appear in time
-
-            status = response.status if response else None
-            title = (page.title() or "").strip().lower()
-            content = page.content()
-            lower_content = content.lower()
-
-            if status == 429:
-                screenshot = page.screenshot(full_page=True) if capture_screenshot else None
-                raise BlockedError(f"Rate limited (429) fetching {url}", screenshot=screenshot)
-
-            checkbox_clicked = False
-            if _looks_blocked(title, lower_content):
-                checkbox_clicked = _click_captcha_checkbox(page, url)
-
-            extra_waited_ms = 0
-            while _looks_blocked(title, lower_content) and extra_waited_ms < CHALLENGE_MAX_EXTRA_WAIT_MS:
-                # The widget may not have rendered yet on the first attempt
-                # above - keep trying each poll until something actually
-                # gets clicked, then stop (no need to keep re-clicking).
-                if not checkbox_clicked:
-                    checkbox_clicked = _click_captcha_checkbox(page, url)
-                page.wait_for_timeout(CHALLENGE_POLL_INTERVAL_MS)
-                extra_waited_ms += CHALLENGE_POLL_INTERVAL_MS
-                title = (page.title() or "").strip().lower()
-                content = page.content()
-                lower_content = content.lower()
-
-            screenshot = page.screenshot(full_page=True) if capture_screenshot else None
-
-            if any(marker in title for marker in BLOCK_TITLE_MARKERS):
-                raise BlockedError(
-                    f"Blocked by bot-protection challenge fetching {url} (title={title!r})",
-                    screenshot=screenshot,
-                )
-            if any(marker in lower_content for marker in BLOCK_CONTENT_MARKERS):
-                raise BlockedError(
-                    f"Blocked by bot-protection challenge fetching {url}", screenshot=screenshot
-                )
-            if status is not None and status >= 400:
-                raise FetchError(f"HTTP {status} fetching {url}", screenshot=screenshot)
-
-            return content, screenshot
+            _new_context_init_script(fresh_context)
+            page = fresh_context.new_page()
+            return _fetch_with_page(page, url, wait_ms, timeout_ms, capture_screenshot)
         finally:
             browser.close()
 
@@ -368,6 +480,11 @@ class Watcher:
     def __init__(self, urls, decoy_urls=None):
         self.urls = urls
         self.decoy_urls = decoy_urls or []
+        # Set by main.py to a persistent context from open_persistent_context()
+        # so checks reuse one real, aging browser profile instead of a fresh
+        # empty one every time. None (the default) falls back to the
+        # original per-fetch throwaway browser in fetch_rendered_html().
+        self.browser_context = None
 
     def refresh_urls(self):
         """Override for watchers whose URLs are date-based and need
@@ -413,7 +530,9 @@ class Watcher:
                 screenshot = None
 
                 try:
-                    html, screenshot = fetch_rendered_html(url, capture_screenshot=is_last_attempt)
+                    html, screenshot = fetch_rendered_html(
+                        url, capture_screenshot=is_last_attempt, context=self.browser_context
+                    )
                 except BlockedError as e:
                     outcome = ("blocked", str(e), e.screenshot)
                 except FetchError as e:

@@ -14,9 +14,11 @@ import config
 import control
 import notifier
 import state as state_module
-from watchers.base import decoy_browse, diff
+from watchers.base import close_persistent_context, decoy_browse, diff, open_persistent_context
 from watchers.bfi import BFIWatcher
 from watchers.science_museum import ScienceMuseumWatcher
+
+BROWSER_PROFILE_DIR = os.path.join("data", "browser_profile")
 
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "ticket_alerter.log")
@@ -241,28 +243,44 @@ def watch_loop(logger):
     run_control = control.RunControl()
     control.start_listener_thread(stats, watchers, run_control)
 
-    while True:
-        run_control.wait_until_running()
-        any_blocked = run_cycle(watchers, state, logger, stats)
-        stats.record_cycle()
-        state_module.save(state)
+    # One real, disk-backed browser profile reused for every check across
+    # the whole process lifetime, instead of a brand new empty-history
+    # browser launched fresh per fetch - see open_persistent_context()'s
+    # docstring for why (a manual browser on the same network hit no
+    # captcha at all on 2026-08-03, while the per-request-fresh automated
+    # session kept getting one). Only the main check() path uses this;
+    # /peek and decoy browsing keep their own disposable sessions so they
+    # never contend with this one from the separate Telegram listener thread.
+    os.makedirs(BROWSER_PROFILE_DIR, exist_ok=True)
+    playwright, browser_context = open_persistent_context(BROWSER_PROFILE_DIR)
+    for watcher in watchers:
+        watcher.browser_context = browser_context
 
-        if any_blocked:
-            consecutive_blocked_cycles += 1
-        else:
-            consecutive_blocked_cycles = 0
+    try:
+        while True:
+            run_control.wait_until_running()
+            any_blocked = run_cycle(watchers, state, logger, stats)
+            stats.record_cycle()
+            state_module.save(state)
 
-        backoff_multiplier = min(2**consecutive_blocked_cycles, MAX_BACKOFF_MULTIPLIER)
-        sleep_seconds = config.CHECK_INTERVAL_SECONDS + random.uniform(
-            -config.JITTER_SECONDS, config.JITTER_SECONDS
-        )
-        sleep_seconds = max(10, sleep_seconds) * backoff_multiplier
+            if any_blocked:
+                consecutive_blocked_cycles += 1
+            else:
+                consecutive_blocked_cycles = 0
 
-        decoy_elapsed = maybe_decoy_browse(watchers, logger)
-        sleep_seconds = max(0, sleep_seconds - decoy_elapsed)
+            backoff_multiplier = min(2**consecutive_blocked_cycles, MAX_BACKOFF_MULTIPLIER)
+            sleep_seconds = config.CHECK_INTERVAL_SECONDS + random.uniform(
+                -config.JITTER_SECONDS, config.JITTER_SECONDS
+            )
+            sleep_seconds = max(10, sleep_seconds) * backoff_multiplier
 
-        logger.info("Cycle complete. Sleeping %.0fs (backoff x%d)", sleep_seconds, backoff_multiplier)
-        time.sleep(sleep_seconds)
+            decoy_elapsed = maybe_decoy_browse(watchers, logger)
+            sleep_seconds = max(0, sleep_seconds - decoy_elapsed)
+
+            logger.info("Cycle complete. Sleeping %.0fs (backoff x%d)", sleep_seconds, backoff_multiplier)
+            time.sleep(sleep_seconds)
+    finally:
+        close_persistent_context(playwright, browser_context)
 
 
 def main():
