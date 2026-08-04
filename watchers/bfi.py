@@ -1,18 +1,20 @@
 """BFI parser.
 
-Parses date-range-filtered search results pages. These are constructed URLs
-(see config.BFI_URLS) that a fresh top-level navigation can load cleanly —
-unlike the paginated search results or clicking a date in the on-page
-calendar, both of which go through a search backend gated by an interactive
-Cloudflare Turnstile challenge that doesn't auto-resolve when reached via a
-same-session click/AJAX navigation. A brand new `page.goto()` straight to
-the same search URL, in a session that never touched page 1 first, loads
-cleanly instead — Turnstile appears to trigger on same-session navigation,
-not on the URL/endpoint itself.
+Parses a single keyword-filtered ("The Odyssey", via search_criteria) search
+results page covering the next config.BFI_DAYS_AHEAD days (see
+config.bfi_urls()) - a constructed URL that a fresh top-level navigation can
+load cleanly, unlike the paginated search results or clicking a date in the
+on-page calendar, both of which go through a search backend gated by an
+interactive Cloudflare Turnstile challenge that doesn't auto-resolve when
+reached via a same-session click/AJAX navigation. A brand new `page.goto()`
+straight to the same search URL, in a session that never touched page 1
+first, loads cleanly instead — Turnstile appears to trigger on same-session
+navigation, not on the URL/endpoint itself.
 
-Each date-range search returns every film/event playing BFI IMAX in that
-window, not just this one, so results are filtered per-item by
-config.BFI_EXPECTED_KEYWORD rather than checking the page as a whole.
+The search still returns any BFI IMAX item whose title happens to mention
+the search terms, not guaranteed to be exactly this one, so results are
+still filtered per-item by config.BFI_EXPECTED_KEYWORD rather than trusting
+the page as a whole.
 """
 
 import logging
@@ -26,10 +28,10 @@ from watchers.base import ParseError, Watcher
 logger = logging.getLogger(__name__)
 
 TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S | re.I)
-# Search results pages cap at 50 items/page. config.BFI_URLS' date windows
-# were sized to stay under this, but if BFI's schedule gets denser this could
-# silently truncate — so it's treated as a parse failure instead, worth
-# alerting on, rather than quietly missing whatever's on page 2+.
+# Search results pages cap at 50 items/page. config.BFI_DAYS_AHEAD is sized
+# to stay under this, but if BFI's schedule gets denser this could silently
+# truncate — so it's treated as a parse failure instead, worth alerting on,
+# rather than quietly missing whatever's on page 2+.
 RESULTS_PAGE_SIZE = 50
 
 

@@ -5,19 +5,30 @@ import datetime
 CHECK_INTERVAL_SECONDS = 180  # ~3 minutes
 JITTER_SECONDS = 45  # random +/- jitter applied to each interval
 
-# Each URL is a date-range-filtered BFI search, loaded as a fresh top-level
+# A single keyword-filtered BFI search, loaded as a fresh top-level
 # navigation. Turnstile only seems to trigger on navigating to the search
 # backend *within* a session that already loaded another page (pagination
 # links, date-filter clicks) — a brand new session going straight to a
-# search URL loads cleanly. Windows are sized to stay comfortably under the
-# 50-result page-size limit based on live testing on 2026-07-31
-# (watchers/bfi.py alerts if a window ever fills up, rather than silently
-# truncating). The *dates* are computed fresh from today() on every call to
-# bfi_urls() below - hardcoding a fixed start date meant it went stale
-# within days and had to be hand-edited, which also meant a stale window got
-# searched (useless, and an odd-looking query for a real visitor to make).
-# Only the window *sizes* in _BFI_WINDOW_DAY_OFFSETS need revisiting if
-# BFI's schedule gets denser.
+# search URL loads cleanly.
+#
+# Previously this was 5 separate date-window URLs covering everything
+# playing IMAX (filtered client-side by BFI_EXPECTED_KEYWORD afterward).
+# Switched 2026-08-04 to searching "The Odyssey" directly via BFI's own
+# search_criteria field instead - far more precise, and cuts 5 requests/cycle
+# down to 1, which matters a lot given BFI's captcha exposure scales with
+# request volume. The tradeoff, confirmed by live testing that day: BFI caps
+# search results at 50/page, and "The Odyssey" alone was already filling a
+# page within ~10-15 days given how many screenings it has - so this only
+# covers the next ~10 days, not the whole run. That's a deliberate choice
+# (discussed and accepted) over going back to multiple windows for full
+# coverage; if a sold-out date reopens further out than that, this won't
+# catch it. Revisit if that tradeoff stops being acceptable.
+#
+# BFI_DAYS_AHEAD is the only thing that would need adjusting if BFI's
+# schedule gets denser and 50 results starts getting reached within fewer
+# than ~10 days (watchers/bfi.py alerts if that ever happens, rather than
+# silently truncating). The date itself is computed fresh from today() on
+# every call to bfi_urls() below, so it never goes stale/needs hand-editing.
 _BFI_ARTICLE_SEARCH_ID = "49C49C83-6BA0-420C-A784-9B485E36E2E0"
 _BFI_SEARCH_URL_TEMPLATE = (
     "https://whatson.bfi.org.uk/imax/Online/default.asp?"
@@ -30,14 +41,11 @@ _BFI_SEARCH_URL_TEMPLATE = (
     "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_to=&"
     "doWork%3A%3AWScontent%3A%3Asearch=1&"
     f"BOparam%3A%3AWScontent%3A%3Asearch%3A%3Aarticle_search_id={_BFI_ARTICLE_SEARCH_ID}&"
-    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_criteria=&"
+    "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_criteria=The+Odyssey&"
     "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_from={frm}&"
     "BOset%3A%3AWScontent%3A%3ASearchCriteria%3A%3Asearch_to={to}"
 )
-# (start_offset, end_offset) in days-from-today for each window - same
-# 10/10/10/~35-day/long-tail spacing as the original hand-picked windows,
-# just anchored to "today" instead of a fixed date so it never goes stale.
-_BFI_WINDOW_DAY_OFFSETS = [(0, 10), (10, 20), (20, 30), (30, 65), (65, 730)]
+BFI_DAYS_AHEAD = 10
 
 
 def _fmt_bfi_date(d: datetime.date) -> str:
@@ -49,17 +57,12 @@ def _fmt_bfi_date(d: datetime.date) -> str:
 
 
 def bfi_urls(today: datetime.date = None) -> list:
-    """The 5 BFI search URLs, with date windows computed fresh from today
-    (or the given date, for testing) so this never needs manual updating."""
+    """The single BFI search URL, covering today through
+    today + BFI_DAYS_AHEAD - computed fresh on every call so it never goes
+    stale."""
     today = today or datetime.date.today()
-    windows = [
-        (today + datetime.timedelta(days=start), today + datetime.timedelta(days=end - 1))
-        for start, end in _BFI_WINDOW_DAY_OFFSETS
-    ]
-    return [
-        _BFI_SEARCH_URL_TEMPLATE.format(frm=_fmt_bfi_date(frm), to=_fmt_bfi_date(to))
-        for frm, to in windows
-    ]
+    to = today + datetime.timedelta(days=BFI_DAYS_AHEAD - 1)
+    return [_BFI_SEARCH_URL_TEMPLATE.format(frm=_fmt_bfi_date(today), to=_fmt_bfi_date(to))]
 
 
 def science_museum_urls(today: datetime.date = None) -> list:
