@@ -422,47 +422,56 @@ def fetch_rendered_html(
 DECOY_DWELL_MS_RANGE = (8000, 25000)
 
 
-def decoy_browse(url: str) -> None:
+def decoy_browse(url: str, playwright) -> None:
     """Best-effort: visit a generic, non-ticketing page on the same site and
     linger a bit, purely so this IP's traffic looks like a visitor poking
     around rather than a script that only ever hits one exact URL on a fixed
-    schedule. Always its own disposable browser session, deliberately never
-    chained into a real ticket-check session - BFI's booking backend was
-    previously found to trigger Turnstile *more* aggressively on same-session
-    navigation (see BFI_URLS' comment in config.py). Never raises - any
-    failure here is silently logged and ignored, since this is optional
-    traffic-pattern hygiene, not part of the actual ticket-checking path."""
+    schedule. Always its own disposable browser (not the persistent profile),
+    deliberately never chained into a real ticket-check session - BFI's
+    booking backend was previously found to trigger Turnstile *more*
+    aggressively on same-session navigation (see BFI_URLS' comment in
+    config.py). Never raises - any failure here is silently logged and
+    ignored, since this is optional traffic-pattern hygiene, not part of the
+    actual ticket-checking path.
+
+    Takes the already-running `playwright` driver (from
+    open_persistent_context, kept alive for the whole process on the main
+    thread) rather than starting its own via `sync_playwright()` - Playwright
+    disallows two sync-API driver instances in the same thread at once, and
+    this is always called from the main thread alongside the persistent
+    context. Only the browser+context here are throwaway; the underlying
+    driver connection is shared.
+    """
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                args=["--disable-blink-features=AutomationControlled"],
-                proxy=_proxy_config(),
+        browser = playwright.chromium.launch(
+            args=["--disable-blink-features=AutomationControlled"],
+            proxy=_proxy_config(),
+        )
+        try:
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                locale=BROWSER_LOCALE,
+                timezone_id=BROWSER_TIMEZONE,
+                viewport=BROWSER_VIEWPORT,
+                extra_http_headers=EXTRA_HTTP_HEADERS,
             )
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            page = context.new_page()
+            page.goto(url, timeout=20000)
+
+            dwell_ms = random.randint(*DECOY_DWELL_MS_RANGE)
+            page.wait_for_timeout(dwell_ms // 3)
             try:
-                context = browser.new_context(
-                    user_agent=USER_AGENT,
-                    locale=BROWSER_LOCALE,
-                    timezone_id=BROWSER_TIMEZONE,
-                    viewport=BROWSER_VIEWPORT,
-                    extra_http_headers=EXTRA_HTTP_HEADERS,
-                )
-                context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-                )
-                page = context.new_page()
-                page.goto(url, timeout=20000)
+                page.mouse.wheel(0, random.randint(200, 800))
+            except Exception:
+                pass  # scroll is a nice-to-have, not essential
+            page.wait_for_timeout(dwell_ms - dwell_ms // 3)
 
-                dwell_ms = random.randint(*DECOY_DWELL_MS_RANGE)
-                page.wait_for_timeout(dwell_ms // 3)
-                try:
-                    page.mouse.wheel(0, random.randint(200, 800))
-                except Exception:
-                    pass  # scroll is a nice-to-have, not essential
-                page.wait_for_timeout(dwell_ms - dwell_ms // 3)
-
-                logger.info("decoy browse: visited %s for ~%dms", url, dwell_ms)
-            finally:
-                browser.close()
+            logger.info("decoy browse: visited %s for ~%dms", url, dwell_ms)
+        finally:
+            browser.close()
     except Exception as e:
         logger.info("decoy browse: failed for %s, ignoring (%r)", url, e)
 

@@ -38,10 +38,13 @@ POLL_TIMEOUT_SECONDS = 30
 HELP_TEXT = (
     "Commands:\n"
     "/status - uptime, checks, alerts, and failures per venue\n"
-    "/peek [venue] - live fetch right now (text + screenshot) so you can\n"
+    "/peek [venue] - live fetch right now (screenshot per URL) so you can\n"
     "  verify, e.g. /peek BFI or /peek Science Museum. No venue = all.\n"
-    "/stop - pause checks (process keeps running so /start still works)\n"
-    "/start - resume checks after /stop\n"
+    "/stop [venue] - pause checks. No venue = pause everything (process\n"
+    "  keeps running so /start still works). With a venue, e.g. /stop BFI,\n"
+    "  pauses only that one - useful for a multi-day cooldown on a venue\n"
+    "  that's gotten IP-blocked without losing coverage on the other.\n"
+    "/start [venue] - resume checks paused by /stop, same venue rules\n"
     "/restart - restart the process (systemd brings it back up)\n"
     "/help - show this message"
 )
@@ -207,12 +210,19 @@ class Stats:
 class RunControl:
     """Pauses/resumes the watch loop in-process via /stop and /start, without
     killing the process - so the command listener (and /start) stay reachable
-    even while paused. No systemd/sudo involved, no privilege escalation."""
+    even while paused. No systemd/sudo involved, no privilege escalation.
+
+    Supports both a global pause (/stop, /start - the whole loop) and
+    per-venue pauses (/stop <venue>, /start <venue>) - added so a venue that
+    gets IP-blocked (e.g. BFI's Cloudflare reputation) can be cooled down for
+    days without losing coverage on a venue that's working fine."""
 
     def __init__(self):
         self._running = threading.Event()
         self._running.set()
         self.stopped_at = None
+        self._lock = threading.Lock()
+        self._paused_venues = {}  # venue name -> time.time() when paused
 
     def stop(self):
         self._running.clear()
@@ -228,11 +238,39 @@ class RunControl:
     def wait_until_running(self):
         self._running.wait()
 
+    def pause_venue(self, name: str):
+        with self._lock:
+            self._paused_venues[name] = time.time()
+
+    def resume_venue(self, name: str):
+        with self._lock:
+            self._paused_venues.pop(name, None)
+
+    def is_venue_paused(self, name: str) -> bool:
+        with self._lock:
+            return name in self._paused_venues
+
+    def venue_paused_since(self, name: str):
+        with self._lock:
+            return self._paused_venues.get(name)
+
 
 def perform_restart():
     """Exit the process. systemd (Restart=always) is expected to bring it back up."""
     logger.info("Restart requested via Telegram command, exiting")
     os._exit(0)
+
+
+def _match_venues(watchers, query: str):
+    """Case-insensitive substring match against display_name - shared by
+    /peek, /stop, and /start so venue matching behaves the same everywhere."""
+    q = query.strip().lower()
+    return [w for w in watchers if q in w.display_name.lower()]
+
+
+def _send_no_venue_match(watchers, query: str):
+    known = ", ".join(w.display_name for w in watchers)
+    notifier.send_message(f"No venue matching {query!r}. Known venues: {known}")
 
 
 def handle_peek(watchers, venue_query: str = None):
@@ -242,13 +280,11 @@ def handle_peek(watchers, venue_query: str = None):
     otherwise only venues whose display name matches (case insensitive,
     substring). Each URL gets exactly one photo, captioned only with the
     venue and a one-word status so screenshots stay identifiable when a
-    venue has several URLs (BFI's 5 date windows)."""
+    venue has several URLs."""
     if venue_query:
-        query = venue_query.strip().lower()
-        matched = [w for w in watchers if query in w.display_name.lower()]
+        matched = _match_venues(watchers, venue_query)
         if not matched:
-            known = ", ".join(w.display_name for w in watchers)
-            notifier.send_message(f"No venue matching {venue_query!r}. Known venues: {known}")
+            _send_no_venue_match(watchers, venue_query)
             return
         watchers = matched
 
@@ -285,17 +321,50 @@ def handle_command(text: str, stats: Stats, watchers, run_control: RunControl):
         else:
             since = format_duration(time.time() - run_control.stopped_at)
             header = f"Watch loop: STOPPED ({since} ago, send /start to resume)"
+        paused_lines = []
+        for watcher in watchers:
+            paused_since = run_control.venue_paused_since(watcher.name)
+            if paused_since is not None:
+                since = format_duration(time.time() - paused_since)
+                paused_lines.append(
+                    f"{watcher.display_name}: PAUSED ({since} ago, send /start {watcher.display_name} to resume)"
+                )
+        if paused_lines:
+            header += "\n" + "\n".join(paused_lines)
         notifier.send_message(header + "\n\n" + stats.snapshot_text())
     elif command == "/peek":
         handle_peek(watchers, arg)
     elif command == "/stop":
-        if run_control.is_running():
+        if arg:
+            matched = _match_venues(watchers, arg)
+            if not matched:
+                _send_no_venue_match(watchers, arg)
+            else:
+                for watcher in matched:
+                    run_control.pause_venue(watcher.name)
+                names = ", ".join(w.display_name for w in matched)
+                notifier.send_message(f"{names} paused — send /start {names} to resume.")
+        elif run_control.is_running():
             run_control.stop()
             notifier.send_message("Stopped. Checks paused — send /start to resume.")
         else:
             notifier.send_message("Already stopped.")
     elif command == "/start":
-        if run_control.is_running():
+        if arg:
+            matched = _match_venues(watchers, arg)
+            if not matched:
+                _send_no_venue_match(watchers, arg)
+            else:
+                still_paused = [w for w in matched if run_control.is_venue_paused(w.name)]
+                if not still_paused:
+                    names = ", ".join(w.display_name for w in matched)
+                    notifier.send_message(f"{names} not paused.")
+                else:
+                    for watcher in still_paused:
+                        run_control.resume_venue(watcher.name)
+                    names = ", ".join(w.display_name for w in still_paused)
+                    notifier.send_message(f"{names} resumed.")
+        elif run_control.is_running():
             notifier.send_message("Already running.")
         else:
             run_control.start()

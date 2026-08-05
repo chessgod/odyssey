@@ -73,7 +73,7 @@ def build_watchers():
     ]
 
 
-def maybe_decoy_browse(watchers, logger) -> float:
+def maybe_decoy_browse(watchers, logger, playwright) -> float:
     """Sometimes (not every cycle - see config.DECOY_BROWSE_PROBABILITY),
     spend part of the idle time between checks visiting a generic page on
     one venue's site in a disposable browser session, so this IP's traffic
@@ -87,7 +87,7 @@ def maybe_decoy_browse(watchers, logger) -> float:
     url = random.choice(watcher.decoy_urls)
     logger.info("%s: decoy browse starting (%s)", watcher.name, url)
     started = time.time()
-    decoy_browse(url)
+    decoy_browse(url, playwright)
     return time.time() - started
 
 
@@ -127,12 +127,15 @@ def _maybe_send_escalation(stats, watcher):
         )
 
 
-def run_cycle(watchers, state, logger, stats) -> bool:
+def run_cycle(watchers, state, logger, stats, run_control) -> bool:
     """Run one check cycle for all watchers. Returns True if any fetch was blocked."""
     any_blocked = False
 
     for watcher in watchers:
         stats.ensure_venue(watcher.name, watcher.display_name)
+        if run_control.is_venue_paused(watcher.name):
+            logger.info("%s: paused, skipping this cycle", watcher.name)
+            continue
         try:
             items_by_url, issues = watcher.check()
         except Exception:
@@ -259,7 +262,7 @@ def watch_loop(logger):
     try:
         while True:
             run_control.wait_until_running()
-            any_blocked = run_cycle(watchers, state, logger, stats)
+            any_blocked = run_cycle(watchers, state, logger, stats, run_control)
             stats.record_cycle()
             state_module.save(state)
 
@@ -274,7 +277,7 @@ def watch_loop(logger):
             )
             sleep_seconds = max(10, sleep_seconds) * backoff_multiplier
 
-            decoy_elapsed = maybe_decoy_browse(watchers, logger)
+            decoy_elapsed = maybe_decoy_browse(watchers, logger, playwright)
             sleep_seconds = max(0, sleep_seconds - decoy_elapsed)
 
             logger.info("Cycle complete. Sleeping %.0fs (backoff x%d)", sleep_seconds, backoff_multiplier)
