@@ -310,8 +310,16 @@ def open_persistent_context(user_data_dir: str):
 
 
 def close_persistent_context(playwright, context):
+    """Best-effort close - if shutdown was triggered by an error/interrupt
+    that already tore down the browser connection, context.close() raises
+    its own secondary error ("Target page, context or browser has been
+    closed"), which previously masked a clean Ctrl+C shutdown as a crash in
+    the log. Nothing useful to do about that case except not let it hide
+    whatever actually triggered the shutdown."""
     try:
         context.close()
+    except Exception as e:
+        logger.info("close_persistent_context: context already gone (%r)", e)
     finally:
         playwright.stop()
 
