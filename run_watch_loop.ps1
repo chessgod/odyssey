@@ -5,7 +5,7 @@
 # One-time setup before first run:
 #   pip install -r requirements.txt
 #   playwright install chromium
-#   copy .env.example to .env and fill in TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+#   copy .env.example to .env and fill in TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_IDS
 #
 # Also set the laptop's power plan to never sleep and to stay on when the
 # lid is closed (if applicable) - a suspend mid-run kills the process the

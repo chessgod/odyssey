@@ -54,10 +54,10 @@ While the watch loop is running, message the bot directly:
   below), it comes straight back up — handy for restarting from your phone.
 - `/help` — lists the commands.
 
-Only messages from the `TELEGRAM_CHAT_ID` in your `.env` are accepted;
-anything else is logged and ignored. Stats are in-memory and reset on every
-restart (including `/restart` itself) — they reflect the current run, not
-a historical total.
+Only messages from a chat listed in `TELEGRAM_CHAT_IDS` (your `.env`) are
+accepted; anything else is logged and ignored. Stats are in-memory and reset
+on every restart (including `/restart` itself) — they reflect the current
+run, not a historical total.
 
 ### Known quirks (found by inspecting the real pages)
 
@@ -148,8 +148,14 @@ cp .env.example .env
 
 ```
 TELEGRAM_BOT_TOKEN=123456:ABC-your-bot-token
-TELEGRAM_CHAT_ID=123456789
+TELEGRAM_CHAT_IDS=123456789
 ```
+
+To alert more than one person, use a comma-separated list
+(`TELEGRAM_CHAT_IDS=123456789,987654321`). Each person must message the bot
+at least once first — Telegram requires that before a bot can message them —
+then find their chat ID by messaging `@userinfobot`. Every listed chat gets
+alerts and can send commands.
 
 ## 3. Install
 

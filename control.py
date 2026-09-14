@@ -1,8 +1,10 @@
 """Two-way Telegram control: /status and /restart commands.
 
 A background thread long-polls Telegram getUpdates and reacts to commands
-from the configured TELEGRAM_CHAT_ID only. Stats is a thread-safe counter
-object the watch loop updates each cycle and /status reads from.
+from any of the configured TELEGRAM_CHAT_IDS (see notifier.get_chat_ids) -
+every configured chat can issue any command, and command replies broadcast
+to all of them the same way alerts do. Stats is a thread-safe counter object
+the watch loop updates each cycle and /status reads from.
 """
 
 import logging
@@ -394,9 +396,9 @@ def _clear_backlog(url: str) -> int:
 
 def run_command_listener(stats: Stats, watchers, run_control: RunControl):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        logger.error("Command listener not started: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set")
+    chat_ids = notifier.get_chat_ids()
+    if not token or not chat_ids:
+        logger.error("Command listener not started: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_IDS not set")
         return
 
     url = TELEGRAM_API_URL.format(token=token)
@@ -422,7 +424,7 @@ def run_command_listener(stats: Stats, watchers, run_control: RunControl):
             text = message.get("text") or ""
             sender_chat_id = str(message.get("chat", {}).get("id", ""))
 
-            if sender_chat_id != str(chat_id):
+            if sender_chat_id not in chat_ids:
                 logger.warning(
                     "Command listener: ignoring message from unauthorized chat %s", sender_chat_id
                 )
